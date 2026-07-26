@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from copy import copy
+from copy import copy, deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,7 @@ from ultralytics.models import yolo
 from ultralytics.models.yolo.lane.dataset import LaneRobotDataset
 from ultralytics.models.yolo.lane.plotting import decode_lane, save_lane_grid
 from ultralytics.models.yolo.lane.val import get_lane_head
-from ultralytics.nn.tasks import LaneRobotModel
+from ultralytics.nn.tasks import LaneRobotModel, yaml_model_load
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, YAML
 from ultralytics.utils.torch_utils import unwrap_model
 
@@ -33,14 +33,47 @@ class LaneRobotTrainer(BaseTrainer):
         for k in ("train", "val", "test"):
             if data.get(k) and not Path(data[k]).is_absolute():
                 data[k] = str(root / data[k])
-        data.setdefault("x_grids", int(getattr(self.args, "lane_x_grids", 640)))
-        data.setdefault("row_anchors", int(getattr(self.args, "lane_row_anchors", 56)))
-        data.setdefault("num_lanes", int(getattr(self.args, "lane_num_lanes", 2)))
-        data.setdefault("y_start", float(getattr(self.args, "lane_y_start", 0.67)))
-        data.setdefault("y_end", float(getattr(self.args, "lane_y_end", 1.0)))
-        data.setdefault("channels", 3)
-        data.setdefault("names", {i: f"lane_{i}" for i in range(int(data["num_lanes"]))})
-        data.setdefault("nc", int(data["num_lanes"]))
+        # The dataset YAML is the single source of truth for lane structure.
+        data["x_grids"] = int(data.get("x_grids", getattr(self.args, "lane_x_grids", 160)))
+        data["row_anchors"] = int(data.get("row_anchors", getattr(self.args, "lane_row_anchors", 56)))
+        data["num_lanes"] = int(data.get("num_lanes", getattr(self.args, "lane_num_lanes", 1)))
+        data["y_start"] = float(data.get("y_start", getattr(self.args, "lane_y_start", 0.67)))
+        data["y_end"] = float(data.get("y_end", getattr(self.args, "lane_y_end", 1.0)))
+        data["channels"] = int(data.get("channels", 3))
+
+        if data["x_grids"] < 2:
+            raise ValueError(f"x_grids must be >= 2, got {data['x_grids']}")
+        if data["row_anchors"] < 2:
+            raise ValueError(f"row_anchors must be >= 2, got {data['row_anchors']}")
+        if data["num_lanes"] < 1:
+            raise ValueError(f"num_lanes must be >= 1, got {data['num_lanes']}")
+
+        # Keep Ultralytics metadata consistent with the number of fixed lane slots.
+        data["nc"] = data["num_lanes"]
+        names = data.get("names")
+        if isinstance(names, list):
+            names = {i: str(name) for i, name in enumerate(names)}
+        elif isinstance(names, dict):
+            try:
+                names = {int(i): str(name) for i, name in names.items()}
+            except (TypeError, ValueError):
+                names = None
+
+        expected_ids = set(range(data["num_lanes"]))
+        if not isinstance(names, dict) or set(names) != expected_ids:
+            if names is not None:
+                LOGGER.warning(
+                    f"Lane names must use IDs 0..{data['num_lanes'] - 1}; generating default names instead."
+                )
+            names = {i: f"lane_{i}" for i in range(data["num_lanes"])}
+        data["names"] = names
+
+        # Mirror the resolved values into args because loss/validation code also reads lane_* options.
+        self.args.lane_x_grids = data["x_grids"]
+        self.args.lane_row_anchors = data["row_anchors"]
+        self.args.lane_num_lanes = data["num_lanes"]
+        self.args.lane_y_start = data["y_start"]
+        self.args.lane_y_end = data["y_end"]
         if not data.get("val"):
             data["val"] = data["train"]
             LOGGER.warning("Lane data yaml has no val split; using train split for validation.")
@@ -76,8 +109,56 @@ class LaneRobotTrainer(BaseTrainer):
         self.model.names = self.data["names"]
         self.model.nc = self.data["nc"]
 
-    def get_model(self, cfg: str | None = None, weights: str | None = None, verbose: bool = True):
-        model = LaneRobotModel(cfg, ch=self.data["channels"], verbose=verbose and RANK == -1)
+    def get_model(self, cfg: str | dict | None = None, weights: str | None = None, verbose: bool = True):
+        """Build a lane model whose output dimensions are controlled by the dataset YAML."""
+        if cfg is None:
+            raise ValueError("A lane model YAML or model config dictionary is required.")
+
+        # cfg can be a YAML path during normal training or a dict when resuming/loading a checkpoint.
+        model_cfg = deepcopy(cfg) if isinstance(cfg, dict) else yaml_model_load(cfg)
+
+        # Override the model YAML defaults with the resolved dataset structure.
+        model_cfg["task"] = "lane"
+        model_cfg["x_grids"] = int(self.data["x_grids"])
+        model_cfg["row_anchors"] = int(self.data["row_anchors"])
+        model_cfg["num_lanes"] = int(self.data["num_lanes"])
+        model_cfg["nc"] = int(self.data["num_lanes"])
+
+        LOGGER.info(
+            "Building LaneRobot model from dataset structure: "
+            f"x_grids={model_cfg['x_grids']}, "
+            f"row_anchors={model_cfg['row_anchors']}, "
+            f"num_lanes={model_cfg['num_lanes']}"
+        )
+
+        model = LaneRobotModel(
+            model_cfg,
+            ch=int(self.data["channels"]),
+            verbose=verbose and RANK == -1,
+        )
+
+        # Fail early if a future model YAML/head implementation ignores the overridden values.
+        head = get_lane_head(model)
+        expected = (
+            int(self.data["x_grids"]),
+            int(self.data["row_anchors"]),
+            int(self.data["num_lanes"]),
+        )
+        actual = (
+            int(head.x_grids),
+            int(head.row_anchors),
+            int(head.num_lanes),
+        )
+        if actual != expected:
+            raise RuntimeError(
+                "Lane model/data structure mismatch: "
+                f"head={actual}, data={expected}. "
+                "Tuple order is (x_grids, row_anchors, num_lanes)."
+            )
+
+        model.names = dict(self.data["names"])
+        model.nc = int(self.data["nc"])
+
         if weights:
             model.load(weights)
         return model
