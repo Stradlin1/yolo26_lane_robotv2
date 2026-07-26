@@ -83,7 +83,7 @@ class LaneRobotDataset(Dataset):
     def _load_label(self, label_path: Path):
         lane = np.full((self.row_anchors, self.num_lanes), self.x_grids, dtype=np.int64)
         lane_x = np.full((self.row_anchors, self.num_lanes), -1.0, dtype=np.float32)
-        row_y = np.linspace(self.y_start, self.y_end, self.row_anchors, dtype=np.float32)
+        row_y = np.linspace(self.y_end, self.y_start, self.row_anchors, dtype=np.float32)
         if not label_path.exists():
             return lane, lane_x, row_y
         if label_path.suffix.lower() == ".npy":

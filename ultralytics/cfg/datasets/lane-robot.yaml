@@ -4,7 +4,7 @@
 # x is normalized [0,1]; x=-1 means absent/no-lane. y is normalized [0,1].
 # Default label path follows images/... -> labels/... with the same basename and .txt suffix.
 
-path: /home/baater/ultralytics/datasets
+path: /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/datasets
 train: images/train
 val: images/valid
 
@@ -14,10 +14,14 @@ val: images/valid
 
 x_grids: 160
 row_anchors: 56
-num_lanes: 1
-y_start: 0.67
+num_lanes: 4
+y_start: 0.333333
 y_end: 1.0
 channels: 3
-nc: 1
+nc: 4
 names:
-  0: lane_0
+  0: lane_follow
+  1: lead_lane
+  2: channel_left
+  3: channel_right
+  
