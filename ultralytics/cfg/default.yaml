@@ -107,8 +107,8 @@ dfl: 1.5 # (float) distribution focal loss gain
 # LaneRobot row-anchor lane detection
 lane_x_grids: 160 # (int) number of x-grid classes before adding the no-lane class; output class dim is lane_x_grids + 1
 lane_row_anchors: 56 # (int) number of y row anchors
-lane_num_lanes: 1 # (int) number of lane instances/channels in the label and output tensor
-lane_y_start: 0.67 # (float) normalized y of the first row anchor for labels without y values
+lane_num_lanes: 4 # (int) number of lane instances/channels in the label and output tensor
+lane_y_start: 0.333333 # (float) normalized top boundary; row anchors are stored bottom-to-top
 lane_y_end: 1.0 # (float) normalized y of the last row anchor for labels without y values
 lane_reduce_channels: 8 # (int) Conv1x1 output channels in the exact YOLOP model.34-style lane head
 lane_hidden_dim: 512 # (int) hidden dimension of the first FC layer in the lane head
