@@ -58,6 +58,7 @@ class LaneRobotDataset(Dataset):
         self.y_start = float(data.get("y_start", data.get("lane_y_start", getattr(args, "lane_y_start", 0.67))))
         self.y_end = float(data.get("y_end", data.get("lane_y_end", getattr(args, "lane_y_end", 1.0))))
         self.imgsz = _imgsz_to_hw(getattr(args, "imgsz", data.get("imgsz", [256, 320])))
+        
 
         # Ultralytics-style augmentation parameters passed by model.train(...).
         self.hsv_h = max(0.0, _float_arg(args, "hsv_h"))
