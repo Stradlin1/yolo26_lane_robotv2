@@ -111,8 +111,20 @@ class LaneRobotValidator(BaseValidator):
         )
 
     def preprocess(self, batch):
-        batch["img"] = batch["img"].to(self.device, non_blocking=self.device.type == "cuda").float() / 255.0
-        batch["lane"] = batch["lane"].to(self.device, non_blocking=self.device.type == "cuda").long()
+        batch["img"] = batch["img"].to(
+            self.device,
+            non_blocking=self.device.type == "cuda",
+        )
+        batch["img"] = (
+            batch["img"].half()
+            if self.args.half
+            else batch["img"].float()
+        ) / 255.0
+
+        batch["lane"] = batch["lane"].to(
+            self.device,
+            non_blocking=self.device.type == "cuda",
+        ).long()
         if "lane_x" in batch:
             batch["lane_x"] = batch["lane_x"].to(self.device, non_blocking=self.device.type == "cuda").float()
         if "lane_y" in batch:

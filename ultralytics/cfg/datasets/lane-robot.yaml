@@ -9,8 +9,8 @@ train: images/train
 val: images/valid
 
 # Optional explicit label roots. Remove these to use images/... -> labels/... convention.
-# train_labels: labels/train
-# val_labels: labels/val
+train_labels: labels_corrected/train
+val_labels: labels_corrected/valid
 
 x_grids: 160
 row_anchors: 56
