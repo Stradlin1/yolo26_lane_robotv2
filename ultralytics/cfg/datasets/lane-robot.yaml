@@ -24,4 +24,8 @@ names:
   1: lead_lane
   2: channel_left
   3: channel_right
-  
+
+# Horizontal-flip lane-slot mapping:
+# channel_left (2) <-> channel_right (3)
+flip_lane_pairs:
+  - [2, 3]

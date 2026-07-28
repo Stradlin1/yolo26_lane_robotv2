@@ -43,7 +43,7 @@ from PIL import Image, ImageOps
 PROJECT_ROOT = Path("/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT")
 DEFAULT_MODEL = (
     PROJECT_ROOT
-    / "runs/lane/lane_n_baseline-4/weights/best.onnx"
+    / "runs/lane/lane_n_baseline-6/weights/best.onnx"
 )
 DEFAULT_SOURCE = PROJECT_ROOT / "test"
 DEFAULT_OUTPUT = PROJECT_ROOT / "test_infer"

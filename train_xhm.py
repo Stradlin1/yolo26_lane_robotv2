@@ -39,13 +39,13 @@ AUGMENTATION_CONFIG = {
     "bgr": 0.0,
 
     # 几何增强：当前没有同步变换车道标签的实现，必须关闭。
-    "degrees": 0.0,
+    "degrees": 0.2,
     "translate": 0.0,
     "scale": 0.0,
     "shear": 0.0,
     "perspective": 0.0,
     "flipud": 0.0,
-    "fliplr": 0.0,
+    "fliplr": 0.5,
 
     # 拼接/混合增强会破坏连续通道结构，保持关闭。
     "mosaic": 0.0,
@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=float, default=3.0)
 
     parser.add_argument("--save-period", type=int, default=10, help="Save checkpoint every N epochs; -1 disables.")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None, help="Path to last.pt for interrupted-run resume.")
     parser.add_argument("--exist-ok", action="store_true", help="Allow reusing an existing experiment directory.")
     parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision.")
@@ -169,7 +169,14 @@ def main() -> None:
     print(f"batch        : {args.batch}")
     print(f"imgsz        : [{args.img_height}, {args.img_width}]")
     print(f"device       : {args.device}")
-    print("augmentation : disabled; current LaneRobotDataset has no synchronized augmentation pipeline")
+    print(
+    "augmentation : "
+    f"fliplr={AUGMENTATION_CONFIG['fliplr']}, "
+    f"flipud={AUGMENTATION_CONFIG['flipud']}, "
+    f"degrees={AUGMENTATION_CONFIG['degrees']}, "
+    f"translate={AUGMENTATION_CONFIG['translate']}, "
+    f"scale={AUGMENTATION_CONFIG['scale']}"
+)
     print("=" * 72)
 
     model.train(**train_config)
