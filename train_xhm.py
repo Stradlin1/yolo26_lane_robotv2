@@ -39,9 +39,9 @@ AUGMENTATION_CONFIG = {
     "bgr": 0.0,
 
     # 几何增强：当前没有同步变换车道标签的实现，必须关闭。
-    "degrees": 0.2,
-    "translate": 0.0,
-    "scale": 0.0,
+    "degrees": 0.5,
+    "translate": 0.03,
+    "scale": 0.05,
     "shear": 0.0,
     "perspective": 0.0,
     "flipud": 0.0,

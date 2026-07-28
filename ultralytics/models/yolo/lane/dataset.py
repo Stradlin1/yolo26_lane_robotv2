@@ -14,6 +14,7 @@ IMG_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 def _imgsz_to_hw(imgsz):
+    """Convert an Ultralytics imgsz value to (height, width)."""
     if isinstance(imgsz, (list, tuple)):
         if len(imgsz) == 2:
             return int(imgsz[0]), int(imgsz[1])
@@ -33,14 +34,16 @@ class LaneRobotDataset(Dataset):
     Label line format:
         lane_id x1 y1 x2 y2 ... xN yN
 
-    Augmentation rules:
-    - Color augmentation changes only the image.
-    - Geometric augmentation applies one homography to both image and lane points.
-    - Transformed lane curves are re-sampled at the original fixed row anchors.
-    - Points outside the image become absent (x=-1 / no-lane class).
-    - Horizontal flip swaps configured semantic lane slots, by default 2 <-> 3.
-    - Mosaic/MixUp/CutMix/Copy-Paste are rejected because they conflict with
-      the fixed semantic-slot, one-curve-per-slot representation.
+    Supported preprocessing and augmentation:
+    - Optional aspect-ratio-preserving Letterbox resize.
+    - Horizontal centering and optional bottom alignment for Letterbox.
+    - HSV/BGR color augmentation.
+    - Synchronized rotation, translation, scaling, shear, perspective and flips.
+    - Re-sampling of transformed curves at the fixed row anchors.
+    - Horizontal-flip semantic slot swapping, e.g. channel_left 2 <-> channel_right 3.
+
+    Unsupported for the current fixed-slot representation:
+    - Mosaic, MixUp, CutMix, Copy-Paste and random erasing.
     """
 
     def __init__(self, img_path, args, data, mode="train"):
@@ -53,11 +56,31 @@ class LaneRobotDataset(Dataset):
         self.row_anchors = int(
             data.get("row_anchors", data.get("lane_row_anchors", getattr(args, "lane_row_anchors", 56)))
         )
-        self.x_grids = int(data.get("x_grids", data.get("lane_x_grids", getattr(args, "lane_x_grids", 640))))
-        self.num_lanes = int(data.get("num_lanes", data.get("lane_num_lanes", getattr(args, "lane_num_lanes", 2))))
-        self.y_start = float(data.get("y_start", data.get("lane_y_start", getattr(args, "lane_y_start", 0.67))))
-        self.y_end = float(data.get("y_end", data.get("lane_y_end", getattr(args, "lane_y_end", 1.0))))
+        self.x_grids = int(
+            data.get("x_grids", data.get("lane_x_grids", getattr(args, "lane_x_grids", 640)))
+        )
+        self.num_lanes = int(
+            data.get("num_lanes", data.get("lane_num_lanes", getattr(args, "lane_num_lanes", 2)))
+        )
+        self.y_start = float(
+            data.get("y_start", data.get("lane_y_start", getattr(args, "lane_y_start", 0.67)))
+        )
+        self.y_end = float(
+            data.get("y_end", data.get("lane_y_end", getattr(args, "lane_y_end", 1.0)))
+        )
         self.imgsz = _imgsz_to_hw(getattr(args, "imgsz", data.get("imgsz", [256, 320])))
+
+        # Letterbox configuration from lane-robot.yaml.
+        self.letterbox = bool(data.get("letterbox", True))
+
+        raw_letterbox_color = data.get("letterbox_color", [0, 0, 0])
+        if not isinstance(raw_letterbox_color, (list, tuple)) or len(raw_letterbox_color) != 3:
+            raise ValueError("letterbox_color must contain three values, for example [0, 0, 0]")
+        self.letterbox_color = tuple(int(np.clip(value, 0, 255)) for value in raw_letterbox_color)
+
+        # True: all vertical padding goes above the image, preserving the image bottom.
+        # False: vertical padding is split between top and bottom.
+        self.letterbox_bottom_align = bool(data.get("letterbox_bottom_align", True))
 
         # Ultralytics-style augmentation parameters passed by model.train(...).
         self.hsv_h = max(0.0, _float_arg(args, "hsv_h"))
@@ -79,7 +102,7 @@ class LaneRobotDataset(Dataset):
         self.copy_paste = max(0.0, _float_arg(args, "copy_paste"))
         self.erasing = max(0.0, _float_arg(args, "erasing"))
 
-        # Can be overridden in lane-robot.yaml, e.g. flip_lane_pairs: [[2, 3]].
+        # Example in lane-robot.yaml: flip_lane_pairs: [[2, 3]]
         self.flip_lane_pairs = self._parse_flip_lane_pairs(data.get("flip_lane_pairs", [[2, 3]]))
         self._validate_augmentation_config()
 
@@ -92,23 +115,32 @@ class LaneRobotDataset(Dataset):
         self.im_files = self._scan_images(self.img_path)
         if not self.im_files:
             raise FileNotFoundError(f"No lane images found in {self.img_path}")
-        self.labels = [self._label_path(p) for p in self.im_files]
+        self.labels = [self._label_path(path) for path in self.im_files]
 
     def _parse_flip_lane_pairs(self, raw_pairs):
         if raw_pairs is None:
             return []
+
         pairs = []
+        used_ids = set()
         for pair in raw_pairs:
             if not isinstance(pair, (list, tuple)) or len(pair) != 2:
                 raise ValueError(f"Each flip_lane_pairs entry must contain two lane IDs, got: {pair!r}")
-            left, right = int(pair[0]), int(pair[1])
-            if not (0 <= left < self.num_lanes and 0 <= right < self.num_lanes):
+
+            first, second = int(pair[0]), int(pair[1])
+            if not (0 <= first < self.num_lanes and 0 <= second < self.num_lanes):
                 raise ValueError(
-                    f"flip_lane_pairs contains out-of-range IDs {(left, right)} for num_lanes={self.num_lanes}"
+                    f"flip_lane_pairs contains out-of-range IDs {(first, second)} "
+                    f"for num_lanes={self.num_lanes}"
                 )
-            if left == right:
-                raise ValueError(f"flip_lane_pairs cannot swap a lane with itself: {(left, right)}")
-            pairs.append((left, right))
+            if first == second:
+                raise ValueError(f"flip_lane_pairs cannot swap a lane with itself: {(first, second)}")
+            if first in used_ids or second in used_ids:
+                raise ValueError(f"A lane ID may appear in only one flip pair, got: {(first, second)}")
+
+            used_ids.update((first, second))
+            pairs.append((first, second))
+
         return pairs
 
     def _validate_augmentation_config(self):
@@ -127,15 +159,16 @@ class LaneRobotDataset(Dataset):
             formatted = ", ".join(f"{name}={value}" for name, value in enabled.items())
             raise ValueError(
                 "LaneRobotDataset does not support sample-composition/erasing augmentation "
-                f"({formatted}). Set mosaic, mixup, cutmix, copy_paste and erasing to 0.0. "
-                "Use HSV and synchronized geometric augmentation instead."
+                f"({formatted}). Set mosaic, mixup, cutmix, copy_paste and erasing to 0.0."
             )
 
         if self.translate > 1.0:
             raise ValueError(f"translate must be in [0, 1], got {self.translate}")
+        if self.scale > 1.0:
+            raise ValueError(f"scale must be in [0, 1], got {self.scale}")
         if self.perspective > 0.01:
             raise ValueError(
-                f"perspective={self.perspective} is unusually large. Use a small value such as 0.0001-0.001."
+                f"perspective={self.perspective} is unusually large; use a small value such as 0.0001-0.001"
             )
 
     @staticmethod
@@ -144,153 +177,142 @@ class LaneRobotDataset(Dataset):
             if path.suffix.lower() == ".txt":
                 base = path.parent
                 return [
-                    Path(x.strip()) if Path(x.strip()).is_absolute() else base / x.strip()
-                    for x in path.read_text().splitlines()
-                    if x.strip()
+                    Path(item.strip()) if Path(item.strip()).is_absolute() else base / item.strip()
+                    for item in path.read_text().splitlines()
+                    if item.strip()
                 ]
             return [path]
-        return sorted(p for p in path.rglob("*") if p.suffix.lower() in IMG_SUFFIXES)
+        return sorted(item for item in path.rglob("*") if item.suffix.lower() in IMG_SUFFIXES)
 
     def _label_path(self, image_path: Path):
         if self.label_dir is not None:
-            base = self.label_dir / image_path.with_suffix(".txt").name
-            if base.exists():
-                return base
+            txt_path = self.label_dir / image_path.with_suffix(".txt").name
+            if txt_path.exists():
+                return txt_path
             return self.label_dir / image_path.with_suffix(".npy").name
+
         parts = list(image_path.parts)
         if "images" in parts:
-            idx = len(parts) - 1 - parts[::-1].index("images")
-            parts[idx] = "labels"
-            p = Path(*parts).with_suffix(".txt")
-            if p.exists():
-                return p
-            return p.with_suffix(".npy")
-        p = image_path.with_suffix(".txt")
-        return p if p.exists() else image_path.with_suffix(".npy")
+            index = len(parts) - 1 - parts[::-1].index("images")
+            parts[index] = "labels"
+            txt_path = Path(*parts).with_suffix(".txt")
+            if txt_path.exists():
+                return txt_path
+            return txt_path.with_suffix(".npy")
+
+        txt_path = image_path.with_suffix(".txt")
+        return txt_path if txt_path.exists() else image_path.with_suffix(".npy")
+
+    def _default_row_y(self):
+        return np.linspace(self.y_end, self.y_start, self.row_anchors, dtype=np.float32)
 
     def _load_label(self, label_path: Path):
         lane = np.full((self.row_anchors, self.num_lanes), self.x_grids, dtype=np.int64)
         lane_x = np.full((self.row_anchors, self.num_lanes), -1.0, dtype=np.float32)
-        row_y = np.linspace(self.y_end, self.y_start, self.row_anchors, dtype=np.float32)
+        row_y = self._default_row_y()
+
         if not label_path.exists():
             return lane, lane_x, row_y
+
         if label_path.suffix.lower() == ".npy":
-            arr = np.load(label_path)
-            if arr.shape == (self.num_lanes, self.row_anchors):
-                arr = arr.T
-            if arr.shape != (self.row_anchors, self.num_lanes):
+            array = np.load(label_path)
+            if array.shape == (self.num_lanes, self.row_anchors):
+                array = array.T
+            if array.shape != (self.row_anchors, self.num_lanes):
                 raise ValueError(
-                    f"Lane npy {label_path} shape {arr.shape}; expected {(self.row_anchors, self.num_lanes)}"
+                    f"Lane npy {label_path} shape {array.shape}; "
+                    f"expected {(self.row_anchors, self.num_lanes)}"
                 )
-            arr = arr.astype(np.float32)
-            valid = arr >= 0
-            lane_x[valid] = np.clip(arr[valid], 0, self.x_grids - 1)
+
+            array = array.astype(np.float32)
+            valid = array >= 0
+            lane_x[valid] = np.clip(array[valid], 0, self.x_grids - 1)
             lane[valid] = np.clip(np.rint(lane_x[valid]), 0, self.x_grids - 1).astype(np.int64)
-            lane[~valid] = self.x_grids
-            return lane.astype(np.int64), lane_x.astype(np.float32), row_y
+            return lane, lane_x, row_y
 
         text = label_path.read_text().strip()
         if not text:
             return lane, lane_x, row_y
+
         for line in text.splitlines():
             if not line.strip():
                 continue
-            vals = [float(x) for x in line.replace(",", " ").split()]
-            if len(vals) < 3:
+
+            values = [float(value) for value in line.replace(",", " ").split()]
+            if len(values) < 3:
                 continue
-            lane_id = int(vals[0])
+
+            lane_id = int(values[0])
             if lane_id < 0 or lane_id >= self.num_lanes:
                 continue
-            pairs = min(self.row_anchors, (len(vals) - 1) // 2)
-            for r in range(pairs):
-                x = vals[1 + 2 * r]
-                y = vals[2 + 2 * r]
-                if 0.0 <= y <= 1.0:
-                    row_y[r] = y
-                if x < 0:
-                    lane[r, lane_id] = self.x_grids
-                    lane_x[r, lane_id] = -1.0
-                elif 0.0 <= x <= 1.0:
-                    xf = float(np.clip(x * (self.x_grids - 1), 0, self.x_grids - 1))
-                    lane_x[r, lane_id] = xf
-                    lane[r, lane_id] = int(np.clip(round(xf), 0, self.x_grids - 1))
+
+            pair_count = min(self.row_anchors, (len(values) - 1) // 2)
+            for row_index in range(pair_count):
+                x_value = values[1 + 2 * row_index]
+                y_value = values[2 + 2 * row_index]
+
+                if 0.0 <= y_value <= 1.0:
+                    row_y[row_index] = y_value
+
+                if x_value < 0.0:
+                    continue
+
+                if 0.0 <= x_value <= 1.0:
+                    x_grid = float(np.clip(x_value * (self.x_grids - 1), 0, self.x_grids - 1))
                 else:
-                    # Already an x-grid index is also accepted for convenience.
-                    xf = float(np.clip(x, 0, self.x_grids - 1))
-                    lane_x[r, lane_id] = xf
-                    lane[r, lane_id] = int(np.clip(round(xf), 0, self.x_grids - 1))
+                    x_grid = float(np.clip(x_value, 0, self.x_grids - 1))
+
+                lane_x[row_index, lane_id] = x_grid
+                lane[row_index, lane_id] = int(np.clip(round(x_grid), 0, self.x_grids - 1))
+
         return lane, lane_x, row_y
-
-    def _random_transform_matrix(self, width: int, height: int):
-        """Create one forward homography mapping original pixels to augmented pixels."""
-        center = np.eye(3, dtype=np.float32)
-        center[0, 2] = -width / 2.0
-        center[1, 2] = -height / 2.0
-
-        perspective = np.eye(3, dtype=np.float32)
-        perspective[2, 0] = np.random.uniform(-self.perspective, self.perspective)
-        perspective[2, 1] = np.random.uniform(-self.perspective, self.perspective)
-
-        angle = np.random.uniform(-self.degrees, self.degrees)
-        scale_factor = np.random.uniform(1.0 - self.scale, 1.0 + self.scale)
-        scale_factor = max(scale_factor, 0.05)
-        rotation = np.eye(3, dtype=np.float32)
-        rotation[:2] = cv2.getRotationMatrix2D((0.0, 0.0), angle, scale_factor)
-
-        shear = np.eye(3, dtype=np.float32)
-        shear[0, 1] = np.tan(np.deg2rad(np.random.uniform(-self.shear, self.shear)))
-        shear[1, 0] = np.tan(np.deg2rad(np.random.uniform(-self.shear, self.shear)))
-
-        translation = np.eye(3, dtype=np.float32)
-        translation[0, 2] = np.random.uniform(0.5 - self.translate, 0.5 + self.translate) * width
-        translation[1, 2] = np.random.uniform(0.5 - self.translate, 0.5 + self.translate) * height
-
-        matrix = translation @ shear @ rotation @ perspective @ center
-
-        do_fliplr = self.fliplr > 0.0 and np.random.random() < self.fliplr
-        do_flipud = self.flipud > 0.0 and np.random.random() < self.flipud
-
-        if do_fliplr:
-            horizontal_flip = np.array(
-                [[-1.0, 0.0, width - 1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32
-            )
-            matrix = horizontal_flip @ matrix
-
-        if do_flipud:
-            vertical_flip = np.array(
-                [[1.0, 0.0, 0.0], [0.0, -1.0, height - 1.0], [0.0, 0.0, 1.0]], dtype=np.float32
-            )
-            matrix = vertical_flip @ matrix
-
-        return matrix, do_fliplr
 
     @staticmethod
     def _contiguous_runs(indices: np.ndarray):
         if indices.size == 0:
             return []
-        split_at = np.where(np.diff(indices) > 1)[0] + 1
-        return np.split(indices, split_at)
+        split_positions = np.where(np.diff(indices) > 1)[0] + 1
+        return np.split(indices, split_positions)
 
     @staticmethod
     def _transform_points(points_xy: np.ndarray, matrix: np.ndarray):
         if points_xy.size == 0:
             return points_xy.astype(np.float32)
+
         homogeneous = np.concatenate(
-            [points_xy.astype(np.float32), np.ones((len(points_xy), 1), dtype=np.float32)], axis=1
+            [points_xy.astype(np.float32), np.ones((len(points_xy), 1), dtype=np.float32)],
+            axis=1,
         )
         transformed = homogeneous @ matrix.T
         denominator = transformed[:, 2]
         valid = np.abs(denominator) > 1e-6
+
         output = np.full((len(points_xy), 2), np.nan, dtype=np.float32)
         output[valid] = transformed[valid, :2] / denominator[valid, None]
         return output
 
-    def _resample_lane_x(self, lane_x: np.ndarray, row_y: np.ndarray, matrix: np.ndarray, width: int, height: int):
-        """Transform lane curves and sample them again at the original fixed row anchors."""
+    def _resample_lane_x(
+        self,
+        lane_x: np.ndarray,
+        source_row_y: np.ndarray,
+        matrix: np.ndarray,
+        source_width: int,
+        source_height: int,
+        target_width: int,
+        target_height: int,
+        target_row_y: np.ndarray | None = None,
+    ):
+        """Transform lane curves and sample them at the target fixed row anchors."""
+        if target_row_y is None:
+            target_row_y = self._default_row_y()
+
         output = np.full_like(lane_x, -1.0, dtype=np.float32)
-        target_y = row_y.astype(np.float32) * max(height - 1, 1)
-        x_denominator = max(self.x_grids - 1, 1)
-        pixel_width = max(width - 1, 1)
+        source_y_pixels = source_row_y.astype(np.float32) * max(source_height - 1, 1)
+        target_y_pixels = target_row_y.astype(np.float32) * max(target_height - 1, 1)
+
+        x_grid_denominator = max(self.x_grids - 1, 1)
+        source_pixel_width = max(source_width - 1, 1)
+        target_pixel_width = max(target_width - 1, 1)
 
         for lane_id in range(self.num_lanes):
             valid_indices = np.flatnonzero(lane_x[:, lane_id] >= 0.0)
@@ -298,40 +320,42 @@ class LaneRobotDataset(Dataset):
                 continue
 
             row_candidates = [[] for _ in range(self.row_anchors)]
-            for run in self._contiguous_runs(valid_indices):
-                x_pixels = lane_x[run, lane_id] / x_denominator * pixel_width
-                y_pixels = target_y[run]
-                transformed = self._transform_points(np.column_stack((x_pixels, y_pixels)), matrix)
 
-                finite = np.isfinite(transformed).all(axis=1)
-                transformed = transformed[finite]
-                if transformed.shape[0] == 0:
+            for run in self._contiguous_runs(valid_indices):
+                x_pixels = lane_x[run, lane_id] / x_grid_denominator * source_pixel_width
+                y_pixels = source_y_pixels[run]
+                source_points = np.column_stack((x_pixels, y_pixels))
+                transformed_points = self._transform_points(source_points, matrix)
+
+                finite = np.isfinite(transformed_points).all(axis=1)
+                transformed_points = transformed_points[finite]
+                if transformed_points.shape[0] == 0:
                     continue
 
-                if transformed.shape[0] == 1:
-                    x_single, y_single = transformed[0]
-                    nearest_row = int(np.argmin(np.abs(target_y - y_single)))
-                    anchor_spacing = height / max(self.row_anchors - 1, 1)
-                    if abs(target_y[nearest_row] - y_single) <= anchor_spacing * 0.6:
+                if transformed_points.shape[0] == 1:
+                    x_single, y_single = transformed_points[0]
+                    nearest_row = int(np.argmin(np.abs(target_y_pixels - y_single)))
+                    anchor_spacing = target_height / max(self.row_anchors - 1, 1)
+                    if abs(target_y_pixels[nearest_row] - y_single) <= anchor_spacing * 0.6:
                         row_candidates[nearest_row].append(float(x_single))
                     continue
 
-                # Intersect every transformed polyline segment with every fixed anchor row.
-                for point_index in range(transformed.shape[0] - 1):
-                    x0, y0 = transformed[point_index]
-                    x1, y1 = transformed[point_index + 1]
+                for point_index in range(transformed_points.shape[0] - 1):
+                    x0, y0 = transformed_points[point_index]
+                    x1, y1 = transformed_points[point_index + 1]
                     delta_y = y1 - y0
                     if abs(delta_y) < 1e-6:
                         continue
 
-                    lower = min(y0, y1) - 1e-4
-                    upper = max(y0, y1) + 1e-4
-                    rows = np.flatnonzero((target_y >= lower) & (target_y <= upper))
+                    lower_y = min(y0, y1) - 1e-4
+                    upper_y = max(y0, y1) + 1e-4
+                    rows = np.flatnonzero((target_y_pixels >= lower_y) & (target_y_pixels <= upper_y))
                     if rows.size == 0:
                         continue
 
-                    t = (target_y[rows] - y0) / delta_y
-                    x_intersections = x0 + t * (x1 - x0)
+                    interpolation = (target_y_pixels[rows] - y0) / delta_y
+                    x_intersections = x0 + interpolation * (x1 - x0)
+
                     for row_index, x_intersection in zip(rows.tolist(), x_intersections.tolist()):
                         if np.isfinite(x_intersection):
                             row_candidates[row_index].append(float(x_intersection))
@@ -339,31 +363,170 @@ class LaneRobotDataset(Dataset):
             for row_index, candidates in enumerate(row_candidates):
                 if not candidates:
                     continue
+
                 x_pixel = float(np.median(candidates))
-                if 0.0 <= x_pixel <= width - 1.0:
-                    output[row_index, lane_id] = x_pixel / pixel_width * x_denominator
+                if 0.0 <= x_pixel <= target_width - 1.0:
+                    output[row_index, lane_id] = (
+                        x_pixel / target_pixel_width * x_grid_denominator
+                    )
 
         return output
 
-    def _build_lane_classes(self, lane_x: np.ndarray):
-        lane = np.full((self.row_anchors, self.num_lanes), self.x_grids, dtype=np.int64)
-        valid = lane_x >= 0.0
-        lane[valid] = np.clip(np.rint(lane_x[valid]), 0, self.x_grids - 1).astype(np.int64)
-        return lane
+    def _letterbox_image_and_lanes(
+        self,
+        image: np.ndarray,
+        lane_x: np.ndarray,
+        source_row_y: np.ndarray,
+    ):
+        """Resize without distortion, pad unused area and transform lane labels."""
+        source_height, source_width = image.shape[:2]
+        target_height, target_width = self.imgsz
 
-    def _apply_geometric_augmentation(self, image: np.ndarray, lane_x: np.ndarray, row_y: np.ndarray):
+        scale = min(target_width / source_width, target_height / source_height)
+        resized_width = max(1, min(target_width, int(round(source_width * scale))))
+        resized_height = max(1, min(target_height, int(round(source_height * scale))))
+
+        resized = cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+        horizontal_padding = target_width - resized_width
+        vertical_padding = target_height - resized_height
+
+        pad_left = horizontal_padding // 2
+        pad_right = horizontal_padding - pad_left
+
+        if self.letterbox_bottom_align:
+            pad_top = vertical_padding
+            pad_bottom = 0
+        else:
+            pad_top = vertical_padding // 2
+            pad_bottom = vertical_padding - pad_top
+
+        canvas = np.full(
+            (target_height, target_width, 3),
+            self.letterbox_color,
+            dtype=image.dtype,
+        )
+        canvas[
+            pad_top : pad_top + resized_height,
+            pad_left : pad_left + resized_width,
+        ] = resized
+
+        scale_x = (resized_width - 1) / max(source_width - 1, 1)
+        scale_y = (resized_height - 1) / max(source_height - 1, 1)
+        matrix = np.array(
+            [
+                [scale_x, 0.0, float(pad_left)],
+                [0.0, scale_y, float(pad_top)],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+
+        target_row_y = self._default_row_y()
+        transformed_lane_x = self._resample_lane_x(
+            lane_x=lane_x,
+            source_row_y=source_row_y,
+            matrix=matrix,
+            source_width=source_width,
+            source_height=source_height,
+            target_width=target_width,
+            target_height=target_height,
+            target_row_y=target_row_y,
+        )
+
+        letterbox_meta = {
+            "scale": float(scale),
+            "resized_shape": (resized_height, resized_width),
+            "pad": (pad_left, pad_top, pad_right, pad_bottom),
+        }
+        return canvas, transformed_lane_x, target_row_y, letterbox_meta
+
+    def _direct_resize_image_and_lanes(
+        self,
+        image: np.ndarray,
+        lane_x: np.ndarray,
+        source_row_y: np.ndarray,
+    ):
+        """Direct resize compatibility path. Normalized lane coordinates remain aligned."""
+        target_height, target_width = self.imgsz
+        resized = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+        return resized, lane_x.astype(np.float32, copy=True), source_row_y.astype(np.float32, copy=True)
+
+    def _random_transform_matrix(self, width: int, height: int):
+        """Create one forward homography mapping current pixels to augmented pixels."""
+        center = np.eye(3, dtype=np.float32)
+        center[0, 2] = -width / 2.0
+        center[1, 2] = -height / 2.0
+
+        perspective_matrix = np.eye(3, dtype=np.float32)
+        perspective_matrix[2, 0] = np.random.uniform(-self.perspective, self.perspective)
+        perspective_matrix[2, 1] = np.random.uniform(-self.perspective, self.perspective)
+
+        angle = np.random.uniform(-self.degrees, self.degrees)
+        scale_factor = np.random.uniform(1.0 - self.scale, 1.0 + self.scale)
+        scale_factor = max(scale_factor, 0.05)
+
+        rotation = np.eye(3, dtype=np.float32)
+        rotation[:2] = cv2.getRotationMatrix2D((0.0, 0.0), angle, scale_factor)
+
+        shear_matrix = np.eye(3, dtype=np.float32)
+        shear_matrix[0, 1] = np.tan(np.deg2rad(np.random.uniform(-self.shear, self.shear)))
+        shear_matrix[1, 0] = np.tan(np.deg2rad(np.random.uniform(-self.shear, self.shear)))
+
+        translation = np.eye(3, dtype=np.float32)
+        translation[0, 2] = np.random.uniform(0.5 - self.translate, 0.5 + self.translate) * width
+        translation[1, 2] = np.random.uniform(0.5 - self.translate, 0.5 + self.translate) * height
+
+        matrix = translation @ shear_matrix @ rotation @ perspective_matrix @ center
+
+        did_fliplr = self.fliplr > 0.0 and np.random.random() < self.fliplr
+        did_flipud = self.flipud > 0.0 and np.random.random() < self.flipud
+
+        if did_fliplr:
+            horizontal_flip = np.array(
+                [
+                    [-1.0, 0.0, width - 1.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+            matrix = horizontal_flip @ matrix
+
+        if did_flipud:
+            vertical_flip = np.array(
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.0, -1.0, height - 1.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+            matrix = vertical_flip @ matrix
+
+        return matrix, did_fliplr
+
+    def _apply_geometric_augmentation(
+        self,
+        image: np.ndarray,
+        lane_x: np.ndarray,
+        row_y: np.ndarray,
+    ):
         height, width = image.shape[:2]
         matrix, did_fliplr = self._random_transform_matrix(width, height)
 
-        use_perspective = self.perspective > 0.0
-        if use_perspective:
+        if self.perspective > 0.0:
             image = cv2.warpPerspective(
                 image,
                 matrix,
                 dsize=(width, height),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
-                borderValue=(114, 114, 114),
+                borderValue=self.letterbox_color,
             )
         else:
             image = cv2.warpAffine(
@@ -372,10 +535,19 @@ class LaneRobotDataset(Dataset):
                 dsize=(width, height),
                 flags=cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
-                borderValue=(114, 114, 114),
+                borderValue=self.letterbox_color,
             )
 
-        lane_x = self._resample_lane_x(lane_x, row_y, matrix, width, height)
+        lane_x = self._resample_lane_x(
+            lane_x=lane_x,
+            source_row_y=row_y,
+            matrix=matrix,
+            source_width=width,
+            source_height=height,
+            target_width=width,
+            target_height=height,
+            target_row_y=row_y,
+        )
 
         if did_fliplr:
             for first, second in self.flip_lane_pairs:
@@ -386,8 +558,10 @@ class LaneRobotDataset(Dataset):
     def _apply_color_augmentation(self, image: np.ndarray):
         if self.hsv_h > 0.0 or self.hsv_s > 0.0 or self.hsv_v > 0.0:
             gains = np.random.uniform(-1.0, 1.0, 3) * np.array(
-                [self.hsv_h, self.hsv_s, self.hsv_v], dtype=np.float32
+                [self.hsv_h, self.hsv_s, self.hsv_v],
+                dtype=np.float32,
             )
+
             hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
             hsv[..., 0] = (hsv[..., 0] + gains[0] * 180.0) % 180.0
             hsv[..., 1] = np.clip(hsv[..., 1] * (1.0 + gains[1]), 0.0, 255.0)
@@ -413,18 +587,38 @@ class LaneRobotDataset(Dataset):
             )
         )
 
+    def _build_lane_classes(self, lane_x: np.ndarray):
+        lane = np.full((self.row_anchors, self.num_lanes), self.x_grids, dtype=np.int64)
+        valid = lane_x >= 0.0
+        lane[valid] = np.clip(np.rint(lane_x[valid]), 0, self.x_grids - 1).astype(np.int64)
+        return lane
+
     def __len__(self):
         return len(self.im_files)
 
-    def __getitem__(self, i):
-        im_file = self.im_files[i]
-        im = Image.open(im_file).convert("RGB")
-        im = ImageOps.exif_transpose(im)
-        ori_shape = (im.height, im.width)
-        im = im.resize((self.imgsz[1], self.imgsz[0]), Image.BILINEAR)
-        image = np.asarray(im).copy()
+    def __getitem__(self, index):
+        image_file = self.im_files[index]
 
-        _, lane_x, lane_y = self._load_label(self.labels[i])
+        with Image.open(image_file) as pil_image:
+            pil_image = pil_image.convert("RGB")
+            pil_image = ImageOps.exif_transpose(pil_image)
+            original_shape = (pil_image.height, pil_image.width)
+            image = np.asarray(pil_image).copy()
+
+        _, lane_x, source_row_y = self._load_label(self.labels[index])
+
+        if self.letterbox:
+            image, lane_x, lane_y, _letterbox_meta = self._letterbox_image_and_lanes(
+                image,
+                lane_x,
+                source_row_y,
+            )
+        else:
+            image, lane_x, lane_y = self._direct_resize_image_and_lanes(
+                image,
+                lane_x,
+                source_row_y,
+            )
 
         if self.is_train:
             if self._has_geometric_augmentation():
@@ -433,26 +627,26 @@ class LaneRobotDataset(Dataset):
 
         lane_x = lane_x.astype(np.float32, copy=False)
         lane = self._build_lane_classes(lane_x)
-        img = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
+        image_tensor = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
 
         return {
-            "img": img,
+            "img": image_tensor,
             "lane": torch.from_numpy(lane),
             "lane_x": torch.from_numpy(lane_x),
             "lane_y": torch.from_numpy(lane_y.astype(np.float32, copy=False)),
             "cls": torch.zeros((1, 1)),
-            "im_file": str(im_file),
-            "ori_shape": ori_shape,
+            "im_file": str(image_file),
+            "ori_shape": original_shape,
         }
 
     @staticmethod
     def collate_fn(batch):
         return {
-            "img": torch.stack([b["img"] for b in batch], 0),
-            "lane": torch.stack([b["lane"] for b in batch], 0),
-            "lane_x": torch.stack([b["lane_x"] for b in batch], 0),
-            "lane_y": torch.stack([b["lane_y"] for b in batch], 0),
+            "img": torch.stack([item["img"] for item in batch], 0),
+            "lane": torch.stack([item["lane"] for item in batch], 0),
+            "lane_x": torch.stack([item["lane_x"] for item in batch], 0),
+            "lane_y": torch.stack([item["lane_y"] for item in batch], 0),
             "cls": torch.zeros((len(batch), 1)),
-            "im_file": [b["im_file"] for b in batch],
-            "ori_shape": [b["ori_shape"] for b in batch],
+            "im_file": [item["im_file"] for item in batch],
+            "ori_shape": [item["ori_shape"] for item in batch],
         }
