@@ -10,7 +10,7 @@ nc: 1
 task: lane
 x_grids: 160
 row_anchors: 56
-num_lanes: 1
+num_lanes: 4
 reduce_channels: 8
 hidden_dim: 512
 feat_h: 8

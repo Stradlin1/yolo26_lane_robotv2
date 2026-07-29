@@ -24,7 +24,7 @@ from ultralytics import YOLO
 
 # 固定为你的项目根目录。脚本应放在该目录下运行。
 PROJECT_ROOT = Path("/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT")
-DEFAULT_MODEL = PROJECT_ROOT / "ultralytics/cfg/models/26/yolo26n-lane.yaml"
+DEFAULT_MODEL = PROJECT_ROOT / "ultralytics/cfg/models/26/yolo26s-lane.yaml"
 DEFAULT_DATA = PROJECT_ROOT / "ultralytics/cfg/datasets/lane-robot.yaml"
 DEFAULT_RUNS = PROJECT_ROOT / "runs/lane"
 
@@ -39,13 +39,13 @@ AUGMENTATION_CONFIG = {
     "bgr": 0.0,
 
     # 几何增强：当前没有同步变换车道标签的实现，必须关闭。
-    "degrees": 0.5,
-    "translate": 0.03,
-    "scale": 0.05,
+    "degrees": 0.0,
+    "translate": 0.0,
+    "scale": 0.0,
     "shear": 0.0,
     "perspective": 0.0,
     "flipud": 0.0,
-    "fliplr": 0.5,
+    "fliplr": 0.0,
 
     # 拼接/混合增强会破坏连续通道结构，保持关闭。
     "mosaic": 0.0,
@@ -65,11 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", type=Path, default=DEFAULT_RUNS, help="Training output root.")
     parser.add_argument("--name", default="lane_n_baseline", help="Experiment directory name.")
 
-    parser.add_argument("--epochs", type=int, default=200, help="Maximum training epochs.")
+    parser.add_argument("--epochs", type=int, default=1000, help="Maximum training epochs.")
     parser.add_argument(
         "--patience",
         type=int,
-        default=50,
+        default=100,
         help="Stop after this many epochs without fitness improvement; 0 disables early stopping.",
     )
     parser.add_argument("--batch", type=int, default=8, help="Batch size; lower to 4 or 2 on CUDA OOM.")

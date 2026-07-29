@@ -18,13 +18,13 @@ num_lanes: 4
 y_start: 0.333333
 y_end: 1.0
 # 保持原图宽高比，不足区域补黑边
-letterbox: true
+letterbox: false
 
 # RGB 黑色
 letterbox_color: [0, 0, 0]
 
 # 纵向不足时，黑边只补在顶部，保持图像底部对齐
-letterbox_bottom_align: true
+letterbox_bottom_align: false
 channels: 3
 nc: 4
 names:
