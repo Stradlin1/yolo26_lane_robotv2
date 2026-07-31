@@ -4,3 +4,6 @@
 /test/
 /test_infer/
 *.zip
+__pycache__/
+*.py[cod]
+sem/*.pt

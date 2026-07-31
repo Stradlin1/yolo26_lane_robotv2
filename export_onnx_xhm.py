@@ -32,7 +32,7 @@ from torch import nn
 
 DEFAULT_WEIGHTS = Path(
     "/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/"
-    "runs/lane/lane_n_baseline-11/weights/best.pt"
+    "runs/lane/lane_n_baseline/weights/best.pt"
 )
 DEFAULT_IMGSZ = (256, 320)
 OPSET = 11
