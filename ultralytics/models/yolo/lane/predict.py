@@ -11,6 +11,12 @@ from PIL import Image
 
 from ultralytics.engine.results import Results
 from ultralytics.models.yolo.detect.predict import DetectionPredictor
+from ultralytics.models.yolo.lane.geometry import (
+    compute_lane_letterbox_meta,
+    letterbox_lane_image,
+    parse_letterbox_color,
+    restore_lanes_from_letterbox,
+)
 from ultralytics.models.yolo.lane.plotting import decode_lane
 from ultralytics.utils import ops
 
@@ -169,13 +175,30 @@ class LaneResults(Results):
 class LaneRobotPredictor(DetectionPredictor):
     """Predictor for fixed-slot LaneRobot row-anchor models."""
 
-    def pre_transform(self, images: list[np.ndarray]) -> list[np.ndarray]:
-        """Resize directly, matching ``LaneRobotDataset`` instead of detection LetterBox preprocessing."""
+    def _target_hw(self) -> tuple[int, int]:
+        """Return predictor input size as (height, width)."""
         if isinstance(self.imgsz, int):
-            height = width = int(self.imgsz)
-        else:
-            height, width = int(self.imgsz[0]), int(self.imgsz[1])
-        return [cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR) for image in images]
+            return int(self.imgsz), int(self.imgsz)
+        return int(self.imgsz[0]), int(self.imgsz[1])
+
+    def pre_transform(self, images: list[np.ndarray]) -> list[np.ndarray]:
+        """Apply the same direct-resize or top-padded LetterBox policy as LaneRobotDataset."""
+        height, width = self._target_hw()
+        if not bool(getattr(self.args, "lane_letterbox", False)):
+            return [cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR) for image in images]
+
+        color = parse_letterbox_color(getattr(self.args, "lane_letterbox_color", [0, 0, 0]))
+        bottom_align = bool(getattr(self.args, "lane_letterbox_bottom_align", True))
+        return [
+            letterbox_lane_image(
+                image,
+                (height, width),
+                # Predictor sources are BGR here; config color follows the RGB dataset convention.
+                color=color[::-1],
+                bottom_align=bottom_align,
+            )[0]
+            for image in images
+        ]
 
     def postprocess(self, preds, img, orig_imgs, **kwargs):
         """Decode raw lane logits and wrap each image in a ``LaneResults`` object."""
@@ -206,14 +229,33 @@ class LaneRobotPredictor(DetectionPredictor):
         paths = self.batch[0]
         names = getattr(self.model, "names", {})
 
-        return [
-            LaneResults(
-                orig_img=orig_img,
-                path=img_path,
-                names=names,
-                lanes=lanes,
-                row_y=row_y,
-                x_grids=x_grids,
+        use_letterbox = bool(getattr(self.args, "lane_letterbox", False))
+        bottom_align = bool(getattr(self.args, "lane_letterbox_bottom_align", True))
+        target_hw = (int(img.shape[-2]), int(img.shape[-1]))
+        results = []
+        for lanes, orig_img, img_path in zip(lane_xy, orig_imgs, paths):
+            result_row_y = row_y.copy()
+            if use_letterbox:
+                meta = compute_lane_letterbox_meta(
+                    orig_img.shape[:2],
+                    target_hw,
+                    bottom_align=bottom_align,
+                )
+                lanes, result_row_y = restore_lanes_from_letterbox(
+                    lanes,
+                    result_row_y,
+                    x_grids,
+                    meta,
+                )
+
+            results.append(
+                LaneResults(
+                    orig_img=orig_img,
+                    path=img_path,
+                    names=names,
+                    lanes=lanes,
+                    row_y=result_row_y,
+                    x_grids=x_grids,
+                )
             )
-            for lanes, orig_img, img_path in zip(lane_xy, orig_imgs, paths)
-        ]
+        return results

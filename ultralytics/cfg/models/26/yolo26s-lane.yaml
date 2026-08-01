@@ -3,14 +3,14 @@
 # YOLO26 single-task LaneRobotV2 model with P4+P5 multi-scale fusion.
 # The lane head keeps the YOLOP/UFLD row-anchor form and upgrades it with:
 # P4+P5 fusion, soft-label compatible cls logits, and sub-grid offset regression.
-# Output: {cls: [B, x_grids + 1, row_anchors, num_lanes], offset: [B, 1, row_anchors, num_lanes]}. Default x_grids=160; x is recovered to pixels by x / x_grids * image_width.
+# Output: {cls: [B, x_grids + 1, row_anchors, num_lanes], offset: [B, 1, row_anchors, num_lanes]}. Default x_grids=320; normalized x maps to grid x * (x_grids - 1).
 
 # Parameters
-nc: 1
+nc: 4
 task: lane
-x_grids: 160
+x_grids: 320
 row_anchors: 56
-num_lanes: 1
+num_lanes: 4
 reduce_channels: 8
 hidden_dim: 512
 feat_h: 8

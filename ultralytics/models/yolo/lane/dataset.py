@@ -10,6 +10,8 @@ import torch
 from PIL import Image, ImageOps
 from torch.utils.data import Dataset
 
+from ultralytics.models.yolo.lane.geometry import letterbox_lane_image, parse_letterbox_color
+
 IMG_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
@@ -57,7 +59,7 @@ class LaneRobotDataset(Dataset):
             data.get("row_anchors", data.get("lane_row_anchors", getattr(args, "lane_row_anchors", 56)))
         )
         self.x_grids = int(
-            data.get("x_grids", data.get("lane_x_grids", getattr(args, "lane_x_grids", 640)))
+            data.get("x_grids", data.get("lane_x_grids", getattr(args, "lane_x_grids", 320)))
         )
         self.num_lanes = int(
             data.get("num_lanes", data.get("lane_num_lanes", getattr(args, "lane_num_lanes", 2)))
@@ -68,19 +70,23 @@ class LaneRobotDataset(Dataset):
         self.y_end = float(
             data.get("y_end", data.get("lane_y_end", getattr(args, "lane_y_end", 1.0)))
         )
-        self.imgsz = _imgsz_to_hw(getattr(args, "imgsz", data.get("imgsz", [256, 320])))
+        self.imgsz = _imgsz_to_hw(getattr(args, "imgsz", data.get("imgsz", [320, 320])))
 
         # Letterbox configuration from lane-robot.yaml.
-        self.letterbox = bool(data.get("letterbox", True))
+        # Direct resize is the lane pipeline default and matches LaneRobotPredictor.
+        # Letterbox is opt-in and applies the same geometry to images and lane labels.
+        self.letterbox = bool(data.get("letterbox", getattr(args, "lane_letterbox", False)))
 
-        raw_letterbox_color = data.get("letterbox_color", [0, 0, 0])
-        if not isinstance(raw_letterbox_color, (list, tuple)) or len(raw_letterbox_color) != 3:
-            raise ValueError("letterbox_color must contain three values, for example [0, 0, 0]")
-        self.letterbox_color = tuple(int(np.clip(value, 0, 255)) for value in raw_letterbox_color)
+        raw_letterbox_color = data.get(
+            "letterbox_color", getattr(args, "lane_letterbox_color", [0, 0, 0])
+        )
+        self.letterbox_color = parse_letterbox_color(raw_letterbox_color)
 
         # True: all vertical padding goes above the image, preserving the image bottom.
         # False: vertical padding is split between top and bottom.
-        self.letterbox_bottom_align = bool(data.get("letterbox_bottom_align", True))
+        self.letterbox_bottom_align = bool(
+            data.get("letterbox_bottom_align", getattr(args, "lane_letterbox_bottom_align", True))
+        )
 
         # Ultralytics-style augmentation parameters passed by model.train(...).
         self.hsv_h = max(0.0, _float_arg(args, "hsv_h"))
@@ -381,56 +387,18 @@ class LaneRobotDataset(Dataset):
         """Resize without distortion, pad unused area and transform lane labels."""
         source_height, source_width = image.shape[:2]
         target_height, target_width = self.imgsz
-
-        scale = min(target_width / source_width, target_height / source_height)
-        resized_width = max(1, min(target_width, int(round(source_width * scale))))
-        resized_height = max(1, min(target_height, int(round(source_height * scale))))
-
-        resized = cv2.resize(
+        canvas, letterbox_meta = letterbox_lane_image(
             image,
-            (resized_width, resized_height),
-            interpolation=cv2.INTER_LINEAR,
-        )
-
-        horizontal_padding = target_width - resized_width
-        vertical_padding = target_height - resized_height
-
-        pad_left = horizontal_padding // 2
-        pad_right = horizontal_padding - pad_left
-
-        if self.letterbox_bottom_align:
-            pad_top = vertical_padding
-            pad_bottom = 0
-        else:
-            pad_top = vertical_padding // 2
-            pad_bottom = vertical_padding - pad_top
-
-        canvas = np.full(
-            (target_height, target_width, 3),
-            self.letterbox_color,
-            dtype=image.dtype,
-        )
-        canvas[
-            pad_top : pad_top + resized_height,
-            pad_left : pad_left + resized_width,
-        ] = resized
-
-        scale_x = (resized_width - 1) / max(source_width - 1, 1)
-        scale_y = (resized_height - 1) / max(source_height - 1, 1)
-        matrix = np.array(
-            [
-                [scale_x, 0.0, float(pad_left)],
-                [0.0, scale_y, float(pad_top)],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
+            self.imgsz,
+            color=self.letterbox_color,
+            bottom_align=self.letterbox_bottom_align,
         )
 
         target_row_y = self._default_row_y()
         transformed_lane_x = self._resample_lane_x(
             lane_x=lane_x,
             source_row_y=source_row_y,
-            matrix=matrix,
+            matrix=letterbox_meta["matrix"],
             source_width=source_width,
             source_height=source_height,
             target_width=target_width,
@@ -438,11 +406,6 @@ class LaneRobotDataset(Dataset):
             target_row_y=target_row_y,
         )
 
-        letterbox_meta = {
-            "scale": float(scale),
-            "resized_shape": (resized_height, resized_width),
-            "pad": (pad_left, pad_top, pad_right, pad_bottom),
-        }
         return canvas, transformed_lane_x, target_row_y, letterbox_meta
 
     def _direct_resize_image_and_lanes(

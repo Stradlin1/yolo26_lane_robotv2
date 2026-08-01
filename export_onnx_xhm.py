@@ -4,20 +4,22 @@ Export the trained Lane Robot model to ONNX opset 11.
 
 The ONNX model has:
     input:
-        images      float32 [B, 3, 256, 320]
+        images      float32 [B, 3, 320, 320]
 
     output:
-        lane_output float32 [B, 162, 56, 4]
+        lane_output float32 [B, x_grids + 2, row_anchors, num_lanes]
+        The new x_grids=320 configuration produces [B, 322, 56, 4].
 
-Output channel layout:
-    lane_output[:, 0:161, :, :]  -> classification logits
-        channels 0..159: horizontal grid logits
-        channel 160: no-lane logit
+Output channel layout for x_grids=320:
+    lane_output[:, 0:321, :, :]  -> classification logits
+        channels 0..319: horizontal grid logits
+        channel 320: no-lane logit
 
-    lane_output[:, 161:162, :, :] -> sub-grid offset in [-0.5, 0.5]
+    lane_output[:, 321:322, :, :] -> sub-grid offset in [-0.5, 0.5]
 
-The default export is static batch=1. Use --dynamic-batch only when the
-deployment runtime needs a variable batch dimension.
+The checkpoint head is the source of truth for x_grids. Legacy x_grids=160
+checkpoints still export 162 channels. The default export is static batch=1;
+use --dynamic-batch only when the deployment runtime needs a variable batch.
 """
 
 from __future__ import annotations
@@ -32,9 +34,9 @@ from torch import nn
 
 DEFAULT_WEIGHTS = Path(
     "/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/"
-    "runs/lane/lane_n_baseline/weights/best.pt"
+    "runs/lane/lane_n_baseline-2/weights/best.pt"
 )
-DEFAULT_IMGSZ = (256, 320)
+DEFAULT_IMGSZ = (320, 320)
 OPSET = 11
 
 
@@ -96,7 +98,7 @@ def parse_args() -> argparse.Namespace:
         nargs=2,
         metavar=("HEIGHT", "WIDTH"),
         default=DEFAULT_IMGSZ,
-        help="Export input size. Default: 256 320.",
+        help="Export input size. Default: 320 320.",
     )
     parser.add_argument(
         "--batch",
@@ -340,8 +342,8 @@ def main() -> None:
     print(f"file          : {output}")
     print(f"size          : {size_mb:.2f} MB")
     print(
-        "output layout : cls logits [0:161], "
-        "offset [161:162]"
+        f"output layout : cls logits [0:{x_grids + 1}], "
+        f"offset [{x_grids + 1}:{x_grids + 2}]"
     )
 
 

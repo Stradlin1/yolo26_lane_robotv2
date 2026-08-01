@@ -116,7 +116,7 @@ flowchart LR
     C --> G[YOLO26 Backbone]
     G --> H[P4/P5 特征融合]
     H --> I[LaneRobotV2 Head]
-    I --> J[cls: B×161×56×4]
+    I --> J[cls: B×321×56×4]
     I --> K[offset: B×1×56×4]
     J --> L[六项联合损失/解码]
     K --> L
@@ -127,7 +127,7 @@ flowchart LR
 当前数据配置为：
 
 ```yaml
-x_grids: 160
+x_grids: 320
 row_anchors: 56
 num_lanes: 4
 ```
@@ -135,13 +135,13 @@ num_lanes: 4
 模型分类输出为：
 
 ```text
-cls: [B, 161, 56, 4]
+cls: [B, 321, 56, 4]
 ```
 
 其中：
 
 - `B`：批大小；
-- `161`：160 个有效横向网格类别 + 1 个 `no-lane` 类别；
+- `321`：320 个有效横向网格类别 + 1 个 `no-lane` 类别；
 - `56`：纵向采样行数量；
 - `4`：固定语义槽位数量。
 
@@ -246,7 +246,7 @@ path: /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/datasets
 train: images/train
 val: images/valid
 
-x_grids: 160
+x_grids: 320
 row_anchors: 56
 num_lanes: 4
 
@@ -332,7 +332,7 @@ ultralytics/cfg/default.yaml
 当前关键默认值：
 
 ```yaml
-lane_x_grids: 160
+lane_x_grids: 320
 lane_row_anchors: 56
 lane_num_lanes: 4
 lane_y_start: 0.333333
@@ -372,13 +372,13 @@ lane_y:  [56]
 - 不可见点在 `lane` 中映射为 `no-lane` 类别 `x_grids`；
 - 不可见点在 `lane_x` 中保留为 `-1`。
 
-数据预处理采用直接 resize：
+数据预处理支持直接 resize 和保持宽高比的 Lane LetterBox。默认配置采用直接 resize：
 
 ```python
 im.resize((img_width, img_height), Image.BILINEAR)
 ```
 
-当前实现未使用 LetterBox，因此图像坐标变换简单，训练和预测必须保持一致。
+当 `letterbox=true` 时，纵向余量全部补在顶部，横向余量在左右居中；图像底部保持对齐。标签使用相同仿射矩阵变换后重新采样到固定 row anchors，预测结果再逆变换回原图。训练和预测必须保持相同配置。
 
 ### 5.4 LaneRobotV2 多线检测头
 
@@ -422,10 +422,10 @@ torch.cat((cls, offset), dim=1)
 在当前配置下，导出张量理论形状为：
 
 ```text
-[B, 162, 56, 4]
+[B, 322, 56, 4]
 ```
 
-其中前 161 个通道为分类输出，最后 1 个通道为偏移输出。ONNX 推理代码必须按照该协议拆分，不能将全部 162 个通道都视为分类概率。
+其中前 321 个通道为分类输出，最后 1 个通道为偏移输出。ONNX 推理代码必须按照该协议拆分，不能将全部 322 个通道都视为分类概率。
 
 ### 5.5 六项联合损失
 
@@ -525,9 +525,9 @@ lane_id x1 y1 x2 y2 ... x56 y56
 
 ### 5.7 训练与预测预处理对齐
 
-检测任务默认 Predictor 常使用 LetterBox。当前 Lane Dataset 使用直接 resize，因此 Predictor 中重写了 `pre_transform()`，同样执行直接 resize。
+Lane Predictor 根据 checkpoint 中的 `lane_letterbox` 设置选择直接 resize 或 Lane LetterBox。LetterBox 使用顶部纵向 padding 和居中的左右 padding，并在后处理阶段把坐标逆变换回原图。
 
-此修改用于避免：
+该闭环用于避免：
 
 - Padding 改变纵向锚点与原图的对应关系；
 - 训练时与预测时的纵横比例处理不一致；
@@ -569,7 +569,7 @@ fitness = Acc@3 + 0.5×Acc@5 - 0.003×MAE + 0.05×Exist
 真实样本读取结果已验证为：
 
 ```text
-batch img shape:    (2, 3, 256, 320)
+batch img shape:    (2, 3, 320, 320)
 batch lane shape:   (2, 56, 4)
 batch lane_x shape: (2, 56, 4)
 batch lane_y shape: (2, 56)
@@ -582,7 +582,7 @@ batch lane_y shape: (2, 56)
 四线模型输出已验证为：
 
 ```text
-cls shape:    (2, 161, 56, 4)
+cls shape:    (2, 321, 56, 4)
 offset shape: (2, 1, 56, 4)
 ```
 
@@ -831,8 +831,8 @@ labels_corrected/...
 | 修正标签未接入训练目录 | 训练继续使用旧标签 | 高 | 固化 `labels_corrected → labels` 流程 |
 | 缺少逐槽位指标 | 总体指标掩盖单类失败 | 高 | 在 Validator 中增加 per-lane metrics |
 | 水平翻转未交换左右语义 | 产生错误监督 | 高 | 保持 `fliplr=0` 或实现槽位交换 |
-| Predictor 与其他部署预处理不一致 | 坐标出现系统偏移 | 高 | ONNX 端严格使用直接 resize |
-| 导出张量拼接 cls 与 offset | 推理拆分错误 | 高 | 按前 161/后 1 通道拆分 |
+| Predictor 与其他部署预处理不一致 | 坐标出现系统偏移 | 高 | ONNX 端严格复用训练时的 Resize 或 LetterBox 策略 |
+| 导出张量拼接 cls 与 offset | 推理拆分错误 | 高 | 按前 321/后 1 通道拆分 |
 | 仅少量样本完成冒烟测试 | 无法代表真实精度 | 中 | 完整数据上训练正式基线 |
 | 全连接式 Lane Head | 量化和输入分辨率适配需验证 | 中 | 进行 ONNX/端侧算子与精度测试 |
 
@@ -912,7 +912,7 @@ y 坐标
 1. 固化模型导出输出协议；
 2. 验证 PyTorch 与 ONNX 输出形状；
 3. 拆分分类张量和偏移张量；
-4. 复现相同的直接 resize、RGB/BGR、归一化和维度顺序；
+4. 复现相同的 Resize/LetterBox、RGB/BGR、归一化和维度顺序；
 5. 对比 PyTorch 与 ONNX 的逐元素误差；
 6. 对比最终曲线坐标误差；
 7. 再进行 FP16、INT8 或目标 NPU 格式转换；
@@ -1034,13 +1034,13 @@ Add PyTorch-ONNX parity test
 ## 附录 B：当前关键形状
 
 ```text
-输入图像：          [B, 3, 256, 320]（已验证配置）
+输入图像：          [B, 3, 320, 320]（当前默认配置）
 整数标签：          [B, 56, 4]
 浮点横向标签：      [B, 56, 4]
 纵向锚点：          [B, 56]
-分类输出：          [B, 161, 56, 4]
+分类输出：          [B, 321, 56, 4]
 偏移输出：          [B, 1, 56, 4]
-导出拼接输出：      [B, 162, 56, 4]
+导出拼接输出：      [B, 322, 56, 4]
 解码后曲线：        [B, 56, 4]
 ```
 

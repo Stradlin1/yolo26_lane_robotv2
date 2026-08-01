@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
 from ultralytics.models.yolo.lane.dataset import LaneRobotDataset
+from ultralytics.models.yolo.lane.geometry import parse_letterbox_color
 from ultralytics.models.yolo.lane.plotting import decode_lane, save_lane_grid
 from ultralytics.models.yolo.lane.val import get_lane_head
 from ultralytics.nn.tasks import LaneRobotModel, yaml_model_load
@@ -34,11 +35,23 @@ class LaneRobotTrainer(BaseTrainer):
             if data.get(k) and not Path(data[k]).is_absolute():
                 data[k] = str(root / data[k])
         # The dataset YAML is the single source of truth for lane structure.
-        data["x_grids"] = int(data.get("x_grids", getattr(self.args, "lane_x_grids", 160)))
+        data["x_grids"] = int(data.get("x_grids", getattr(self.args, "lane_x_grids", 320)))
         data["row_anchors"] = int(data.get("row_anchors", getattr(self.args, "lane_row_anchors", 56)))
         data["num_lanes"] = int(data.get("num_lanes", getattr(self.args, "lane_num_lanes", 1)))
         data["y_start"] = float(data.get("y_start", getattr(self.args, "lane_y_start", 0.67)))
         data["y_end"] = float(data.get("y_end", getattr(self.args, "lane_y_end", 1.0)))
+        data["letterbox"] = bool(data.get("letterbox", getattr(self.args, "lane_letterbox", False)))
+        data["letterbox_color"] = list(
+            parse_letterbox_color(
+                data.get("letterbox_color", getattr(self.args, "lane_letterbox_color", [0, 0, 0]))
+            )
+        )
+        data["letterbox_bottom_align"] = bool(
+            data.get(
+                "letterbox_bottom_align",
+                getattr(self.args, "lane_letterbox_bottom_align", True),
+            )
+        )
         data["channels"] = int(data.get("channels", 3))
 
         if data["x_grids"] < 2:
@@ -74,6 +87,9 @@ class LaneRobotTrainer(BaseTrainer):
         self.args.lane_num_lanes = data["num_lanes"]
         self.args.lane_y_start = data["y_start"]
         self.args.lane_y_end = data["y_end"]
+        self.args.lane_letterbox = data["letterbox"]
+        self.args.lane_letterbox_color = data["letterbox_color"]
+        self.args.lane_letterbox_bottom_align = data["letterbox_bottom_align"]
         if not data.get("val"):
             data["val"] = data["train"]
             LOGGER.warning("Lane data yaml has no val split; using train split for validation.")

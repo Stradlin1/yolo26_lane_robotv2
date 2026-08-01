@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split", default="train", choices=("train", "val", "test"))
     parser.add_argument("--samples", type=int, default=2, help="Number of real images used for forward/backward.")
-    parser.add_argument("--imgsz", nargs=2, type=int, default=(256, 320), metavar=("H", "W"))
+    parser.add_argument("--imgsz", nargs=2, type=int, default=(320, 320), metavar=("H", "W"))
     parser.add_argument("--device", default="cpu", help="cpu, cuda, cuda:0, etc.")
     parser.add_argument(
         "--max-errors",
@@ -57,11 +57,14 @@ def make_trainer(data_yaml: Path, imgsz: tuple[int, int]) -> LaneRobotTrainer:
         data=str(data_yaml),
         imgsz=list(imgsz),
         workers=0,
-        lane_x_grids=160,
+        lane_x_grids=320,
         lane_row_anchors=56,
         lane_num_lanes=1,
         lane_y_start=0.67,
         lane_y_end=1.0,
+        lane_letterbox=False,
+        lane_letterbox_color=[0, 0, 0],
+        lane_letterbox_bottom_align=True,
     )
     trainer.data = trainer.get_dataset()
     return trainer
@@ -313,7 +316,20 @@ def main() -> int:
     print("=== 1. Resolve real dataset YAML ===")
     trainer = make_trainer(data_yaml, tuple(args.imgsz))
     data = trainer.data
-    for key in ("path", args.split, "x_grids", "row_anchors", "num_lanes", "y_start", "y_end", "nc", "names"):
+    for key in (
+        "path",
+        args.split,
+        "x_grids",
+        "row_anchors",
+        "num_lanes",
+        "y_start",
+        "y_end",
+        "letterbox",
+        "letterbox_color",
+        "letterbox_bottom_align",
+        "nc",
+        "names",
+    ):
         print(f"{key}: {data.get(key)}")
 
     split_path_raw = data.get(args.split)

@@ -101,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--x-grids",
         type=int,
-        default=160,
+        default=320,
         help="Number of x grids, used only when a label x value is greater than 1.",
     )
     parser.add_argument("--point-radius", type=int, default=3, help="Radius of each anchor point in pixels.")

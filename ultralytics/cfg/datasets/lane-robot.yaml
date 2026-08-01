@@ -12,19 +12,20 @@ val: images/valid
 train_labels: labels_corrected/train
 val_labels: labels_corrected/valid
 
-x_grids: 160
+x_grids: 320
 row_anchors: 56
 num_lanes: 4
 y_start: 0.333333
 y_end: 1.0
-# 保持原图宽高比，不足区域补黑边
+# false：直接拉伸到 imgsz（当前训练/推理统一采用该方式，不补黑边）
+# true：保持原图宽高比，在顶部和左右补边，并同步变换标签
 letterbox: false
 
 # RGB 黑色
 letterbox_color: [0, 0, 0]
 
-# 纵向不足时，黑边只补在顶部，保持图像底部对齐
-letterbox_bottom_align: false
+# 仅 letterbox=true 时生效；true 表示纵向黑边全部补在顶部，左右黑边保持居中
+letterbox_bottom_align: true
 channels: 3
 nc: 4
 names:

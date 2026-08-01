@@ -14,7 +14,7 @@
 [B, lane_x_grids + 1, lane_row_anchors, lane_num_lanes]
 ```
 
-- `lane_x_grids=640` 表示 x 方向 640 个分类位置。
+- `lane_x_grids=320` 表示 x 方向 320 个有效分类位置。
 - 额外的 `+1` 是 no-lane 类。
 - `lane_row_anchors=56` 表示 y 方向 56 行。
 - `lane_num_lanes` 是车道线数量，必须与你标注里的 lane_id 数量一致。
@@ -75,7 +75,7 @@ YOLO26 取 backbone 最后的 P5/32 深层特征，对应原 YOLOP 图里的 `/m
 yolo task=lane mode=train \
   model=ultralytics/cfg/models/26/yolo26-lane.yaml \
   data=ultralytics/cfg/datasets/lane-robot.yaml \
-  imgsz=256,320 \
+  imgsz=320 \
   epochs=100 batch=16 plots=True
 ```
 
@@ -85,8 +85,8 @@ yolo task=lane mode=train \
 yolo task=lane mode=train \
   model=ultralytics/cfg/models/26/yolo26-lane.yaml \
   data=your_lane.yaml \
-  lane_x_grids=640 lane_row_anchors=56 lane_num_lanes=4 \
-  imgsz=256,320 plots=True
+  lane_x_grids=320 lane_row_anchors=56 lane_num_lanes=4 \
+  imgsz=320 plots=True
 ```
 
 ## Loss

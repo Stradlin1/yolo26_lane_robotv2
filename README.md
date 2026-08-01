@@ -2,7 +2,7 @@
 
 基于 Ultralytics YOLO26 改造的机器人场景多线检测项目。
 
-> 更新日期：2026-07-29 
+> 更新日期：2026-08-01
 
 本项目已经从原始的单线 Row-Anchor 检测，改造成**固定语义槽位的多线检测系统**。当前稳定主链路支持四种语义线，每种语义在一张图中最多对应一条曲线；训练、验证、预测、结果可视化和权重保存链路已经跑通。
 
@@ -60,7 +60,7 @@
 | Trainer | 已验证 | 已完成真实数据 1 epoch 冒烟训练 |
 | Validator | 已验证 | 可完成验证与权重保存 |
 | Predictor | 已接通 | 可解码、画线、保存图片和 txt |
-| 直接 Resize | 已完成 | 不使用 LetterBox 补黑边，训练/推理保持一致 |
+| Resize / LetterBox | 已完成 | 可配置直接拉伸或顶部/左右补黑，标签与预测坐标同步变换 |
 | 多线水平翻转槽位交换 | 已实现/配置化 | `channel_left` 与 `channel_right` 需要同步交换 |
 | 完整数据集正式训练 | 进行中 | 需要先完成全量标签检查和无增强基线 |
 | 逐槽位指标 | 待完成 | 当前总体指标可能掩盖单槽位失败 |
@@ -74,7 +74,7 @@
 ```text
 图片
   ↓
-直接 Resize 到训练尺寸
+按配置直接 Resize，或保持比例并在顶部/左右 LetterBox
   ↓
 YOLO26 Backbone
   ↓
@@ -92,7 +92,7 @@ Row-Anchor 解码
 默认参数：
 
 ```text
-X = x_grids = 160
+X = x_grids = 320
 R = row_anchors = 56
 L = num_lanes = 4
 ```
@@ -100,11 +100,11 @@ L = num_lanes = 4
 对应输出：
 
 ```text
-cls:    [B, 161, 56, 4]
+cls:    [B, 321, 56, 4]
 offset: [B,   1, 56, 4]
 ```
 
-其中第 `160` 个分类位置是 `no-lane` 类。
+其中索引 `320` 是 `no-lane` 类，有效横向位置索引为 `0..319`。
 
 ---
 
@@ -135,7 +135,7 @@ task=lane
 最新设计中，数据 YAML 是以下参数的主要来源：
 
 ```yaml
-x_grids: 160
+x_grids: 320
 row_anchors: 56
 num_lanes: 4
 ```
@@ -213,15 +213,17 @@ result.save_txt()
 
 ### 4.6 训练与推理预处理对齐
 
-当前使用**直接压缩/拉伸 Resize**，不使用 LetterBox 补黑边。
+支持两种互斥模式，训练、验证、PyTorch 推理和 ONNX 推理必须选择相同模式：
 
-这样做的原因：
+```yaml
+# false：直接拉伸到 320x320
+# true：保持宽高比，纵向余量全部补在顶部，横向余量在左右居中
+letterbox: false
+letterbox_color: [0, 0, 0]
+letterbox_bottom_align: true
+```
 
-- Row Anchor 标签与图像归一化坐标直接对应。
-- LetterBox 会改变有效画面区域和纵向坐标关系。
-- 若训练和推理预处理不同，会造成解码位置系统性偏移。
-
-因此训练、验证、PyTorch 推理和 ONNX 推理必须采用同一种 Resize 规则。
+启用 LetterBox 后，图片底部保持与模型输入底部对齐。标签会使用同一个缩放和平移矩阵变换，并重新采样到目标 56 个 row anchors；落在黑边或画面外的点变为 no-lane。预测结果会执行逆变换后再绘制或保存到原图，避免 padding 引起系统性偏移。
 
 ### 4.7 多线几何增强与水平翻转
 
@@ -320,7 +322,7 @@ val: images/valid
 train_labels: labels_corrected/train
 val_labels: labels_corrected/valid
 
-x_grids: 160
+x_grids: 320
 row_anchors: 56
 num_lanes: 4
 
@@ -413,10 +415,10 @@ num_lanes: 4
 横向分类数由：
 
 ```yaml
-x_grids: 160
+x_grids: 320
 ```
 
-决定，模型内部会额外增加一个 no-lane 类，因此分类维度为 161。
+决定，模型内部会额外增加一个 no-lane 类，因此分类维度为 321。
 
 ### 7.3 为什么模型 YAML 中可能仍看到 `nc: 1`
 
@@ -436,13 +438,13 @@ names:
 判断是否真正生效，不要只看 YAML 文本，应查看模型构建日志：
 
 ```text
-LaneRobotV2 [160, 56, 4, ...]
+LaneRobotV2 [320, 56, 4, ...]
 ```
 
 以及前向输出：
 
 ```text
-cls:    [B, 161, 56, 4]
+cls:    [B, 321, 56, 4]
 offset: [B, 1, 56, 4]
 ```
 
@@ -526,6 +528,115 @@ hsv_v: 0.10
 
 在基线稳定后，再逐项加入轻微平移、缩放和旋转，不能一次打开所有增强。
 
+### 8.4 当前训练配置基线
+
+当前仓库的默认训练基线面向 `320x320` 输入、四语义槽位、多线 Row-Anchor 检测。建议先使用该配置完成无增强基线训练，再讨论是否加入几何增强或切换 LetterBox。
+
+核心配置：
+
+```yaml
+task: lane
+model: ultralytics/cfg/models/26/yolo26n-lane.yaml
+data: ultralytics/cfg/datasets/lane-robot.yaml
+imgsz: 320
+
+x_grids: 320
+row_anchors: 56
+num_lanes: 4
+y_start: 0.333333
+y_end: 1.0
+
+letterbox: false
+letterbox_color: [0, 0, 0]
+letterbox_bottom_align: true
+
+flip_lane_pairs:
+  - [2, 3]
+```
+
+对应 `default.yaml` 中的 LaneRobot 参数：
+
+```yaml
+lane_x_grids: 320
+lane_row_anchors: 56
+lane_num_lanes: 4
+lane_y_start: 0.333333
+lane_y_end: 1.0
+lane_letterbox: false
+lane_letterbox_color: [0, 0, 0]
+lane_letterbox_bottom_align: true
+
+lane_ce: 1.0
+lane_loc: 2.0
+lane_exist: 1.5
+lane_smooth: 0.03
+lane_curv: 0.02
+lane_offset: 3.0
+lane_label_smoothing: 0.0
+lane_soft_label: true
+lane_soft_sigma: 1.0
+lane_softargmax_topk: 5
+lane_exist_thr: 0.5
+
+lane_post_smooth: true
+lane_poly_degree: 2
+lane_poly_blend: 0.5
+```
+
+当前预处理默认是直接拉伸到 `320x320`，即：
+
+```yaml
+letterbox: false
+```
+
+如果要训练保持比例、顶部和左右补黑边的模型，应在数据 YAML 中改为：
+
+```yaml
+letterbox: true
+letterbox_color: [0, 0, 0]
+letterbox_bottom_align: true
+```
+
+同一组权重的训练、验证、PyTorch 推理和 ONNX 推理必须使用同一种预处理策略。直接 Resize 训练得到的权重不要用 LetterBox 推理；LetterBox 训练得到的 ONNX 模型推理时需要加 `--letterbox`。
+
+当前建议的无增强训练超参：
+
+```yaml
+epochs: 100
+batch: 8
+workers: 4
+device: 0
+lr0: 0.0003
+lrf: 0.01
+weight_decay: 0.01
+warmup_epochs: 3.0
+
+degrees: 0.0
+translate: 0.0
+scale: 0.0
+shear: 0.0
+perspective: 0.0
+fliplr: 0.0
+flipud: 0.0
+mosaic: 0.0
+mixup: 0.0
+cutmix: 0.0
+copy_paste: 0.0
+erasing: 0.0
+
+hsv_h: 0.0
+hsv_s: 0.05
+hsv_v: 0.10
+```
+
+训练环境使用仓库对应的 Conda 环境：
+
+```bash
+conda activate lane_robot
+cd /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT
+pip install -e .
+```
+
 ---
 
 ## 9. 训练
@@ -535,6 +646,7 @@ hsv_v: 0.10
 建议在项目虚拟环境中以 editable 方式安装当前源码：
 
 ```bash
+conda activate lane_robot
 cd /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT
 pip install -e .
 ```
@@ -554,6 +666,7 @@ python -c "import ultralytics; print(ultralytics.__file__)"
 ### 9.2 无增强基线训练
 
 ```bash
+conda activate lane_robot
 cd /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT
 
 yolo task=lane mode=train \
@@ -564,6 +677,10 @@ yolo task=lane mode=train \
   imgsz=320 \
   workers=4 \
   device=0 \
+  lr0=0.0003 \
+  lrf=0.01 \
+  weight_decay=0.01 \
+  warmup_epochs=3.0 \
   degrees=0.0 \
   translate=0.0 \
   scale=0.0 \
@@ -575,6 +692,10 @@ yolo task=lane mode=train \
   mixup=0.0 \
   cutmix=0.0 \
   copy_paste=0.0 \
+  erasing=0.0 \
+  hsv_h=0.0 \
+  hsv_s=0.05 \
+  hsv_v=0.10 \
   project=/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/runs/lane \
   name=baseline_no_aug
 ```
@@ -592,7 +713,7 @@ imgsz
 启动训练后必须确认：
 
 ```text
-LaneRobotV2 [160, 56, 4, ...]
+LaneRobotV2 [320, 56, 4, ...]
 ```
 
 以及日志中存在六项 Loss：
@@ -667,7 +788,7 @@ yolo task=lane mode=predict \
 
 关键要求：
 
-- ONNX 输入预处理必须与训练保持一致，使用直接 Resize。
+- ONNX 输入预处理必须与训练保持一致：直接 Resize 模型不加参数，LetterBox 模型使用 `infer_onnx_xhm.py --letterbox`。
 - 明确输出中 `cls` 与 `offset` 的拼接或多输出形式。
 - 解码时使用相同的 `x_grids`、`row_anchors`、`num_lanes` 和存在性阈值。
 - 保存结果时恢复到原图尺寸。
@@ -722,7 +843,7 @@ scripts/
 已验证批次形状：
 
 ```text
-batch img:    [2, 3, 256, 320]
+batch img:    [2, 3, 320, 320]
 batch lane:   [2, 56, 4]
 batch lane_x: [2, 56, 4]
 batch lane_y: [2, 56]
@@ -733,7 +854,7 @@ batch lane_y: [2, 56]
 已验证：
 
 ```text
-cls:    [2, 161, 56, 4]
+cls:    [2, 321, 56, 4]
 offset: [2, 1, 56, 4]
 ```
 

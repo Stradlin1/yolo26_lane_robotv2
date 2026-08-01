@@ -8,12 +8,12 @@ mode: train # (str) YOLO mode, i.e. train, val, predict, export, track, benchmar
 
 # Train settings -------------------------------------------------------------------------------------------------------
 model: yolo26m-lane.yaml # (str, optional) path to model file, i.e. yolov8n.pt or yolov8n.yaml
-data: /home/baater/ultralytics/ultralytics/cfg/datasets/lane-robot.yaml # (str, optional) path to data file, i.e. coco8.yaml
+data: ultralytics/cfg/datasets/lane-robot.yaml # (str, optional) path to data file, i.e. coco8.yaml
 epochs: 800 # (int) number of epochs to train for
 time: # (float, optional) max hours to train; overrides epochs if set
 patience: 50 # (int) early stop after N epochs without val improvement
 batch: 8 # (int | float) batch size as int (e.g. 16), or float 0.0–1.0 for AutoBatch fraction of GPU memory
-imgsz: 640 # (int | list) train/val use int (square); predict/export may use [h,w]
+imgsz: 320 # (int | list) default lane train/val/predict size; direct resize produces 320x320
 save: True # (bool) save train checkpoints and predict results
 save_period: -1 # (int) save checkpoint every N epochs; disabled if < 1
 cache: False # (bool | str) cache images in RAM (True/'ram') or on 'disk' to speed dataloading; False disables
@@ -105,11 +105,14 @@ cls_pw: 0.0 # (float) class weights power for handling class imbalance (0.0=disa
 dfl: 1.5 # (float) distribution focal loss gain
 
 # LaneRobot row-anchor lane detection
-lane_x_grids: 160 # (int) number of x-grid classes before adding the no-lane class; output class dim is lane_x_grids + 1
+lane_x_grids: 320 # (int) number of x-grid classes before adding the no-lane class; output class dim is lane_x_grids + 1
 lane_row_anchors: 56 # (int) number of y row anchors
 lane_num_lanes: 4 # (int) number of lane instances/channels in the label and output tensor
 lane_y_start: 0.333333 # (float) normalized top boundary; row anchors are stored bottom-to-top
 lane_y_end: 1.0 # (float) normalized y of the last row anchor for labels without y values
+lane_letterbox: False # (bool) preserve aspect ratio and pad instead of stretching directly
+lane_letterbox_color: [0, 0, 0] # (list[int]) three-channel LetterBox padding color
+lane_letterbox_bottom_align: True # (bool) place all vertical padding above the image; horizontal padding stays centered
 lane_reduce_channels: 8 # (int) Conv1x1 output channels in the exact YOLOP model.34-style lane head
 lane_hidden_dim: 512 # (int) hidden dimension of the first FC layer in the lane head
 lane_feat_h: 8 # (int) fixed feature height before flatten; original model uses 8 for 256x320 input at stride 32

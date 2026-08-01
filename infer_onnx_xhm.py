@@ -18,15 +18,17 @@
 
 模型输入：
     RGB, float32, BCHW, [0, 1]
-    默认尺寸为 256x320；若 ONNX 输入形状是静态的，会自动读取。
+    默认尺寸为 320x320；若 ONNX 输入形状是静态的，会自动读取。
 
 模型输出支持：
-    1. 单输出 [B, 162, 56, 4]
-       - 0:161 为分类 logits
-       - 161:162 为 offset
+    1. 单输出 [B, X+2, R, L]；当前 X=320 时为 [B, 322, 56, 4]
+       - 0:321 为分类 logits（含索引 320 的 no-lane 类）
+       - 321:322 为 offset
     2. 双输出
-       - cls    [B, 161, 56, 4]
+       - cls    [B, 321, 56, 4]
        - offset [B,   1, 56, 4]
+
+通道数会从 ONNX 输出动态解析，因此仍可读取旧的 X=160 模型。
 """
 
 from __future__ import annotations
@@ -38,6 +40,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
+
+from ultralytics.models.yolo.lane.geometry import letterbox_lane_image, restore_lanes_from_letterbox
 
 
 PROJECT_ROOT = Path("/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT")
@@ -93,6 +97,11 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "cpu", "cuda"),
         default="auto",
         help="ONNX Runtime 执行设备，默认 auto。",
+    )
+    parser.add_argument(
+        "--letterbox",
+        action="store_true",
+        help="保持宽高比，纵向黑边全部补在顶部，横向黑边在左右居中；必须与训练设置一致。",
     )
     parser.add_argument(
         "--exist-thr",
@@ -204,7 +213,7 @@ def get_input_hw(session) -> tuple[int, int]:
         return int(height), int(width)
 
     # 动态空间尺寸时使用训练尺寸。
-    return 256, 320
+    return 320, 320
 
 
 def load_image_rgb(path: Path) -> np.ndarray:
@@ -214,22 +223,40 @@ def load_image_rgb(path: Path) -> np.ndarray:
         return np.asarray(image).copy()
 
 
-def preprocess(
+def preprocess_with_policy(
     rgb_image: np.ndarray,
     input_hw: tuple[int, int],
-) -> np.ndarray:
+    *,
+    letterbox: bool,
+) -> tuple[np.ndarray, dict | None]:
     height, width = input_hw
-
-    resized = cv2.resize(
-        rgb_image,
-        (width, height),
-        interpolation=cv2.INTER_LINEAR,
-    )
+    if letterbox:
+        resized, meta = letterbox_lane_image(
+            rgb_image,
+            (height, width),
+            color=(0, 0, 0),
+            bottom_align=True,
+        )
+    else:
+        resized = cv2.resize(
+            rgb_image,
+            (width, height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        meta = None
 
     tensor = resized.astype(np.float32) / 255.0
     tensor = np.transpose(tensor, (2, 0, 1))
     tensor = np.expand_dims(tensor, axis=0)
-    return np.ascontiguousarray(tensor)
+    return np.ascontiguousarray(tensor), meta
+
+
+def preprocess(
+    rgb_image: np.ndarray,
+    input_hw: tuple[int, int],
+) -> np.ndarray:
+    """Backward-compatible direct-resize preprocessing helper."""
+    return preprocess_with_policy(rgb_image, input_hw, letterbox=False)[0]
 
 
 def split_outputs(
@@ -254,7 +281,7 @@ def split_outputs(
             )
 
         if output.shape[1] >= 3:
-            # 当前模型为 162 = 161 cls + 1 offset。
+            # 合并输出约定为 (X+1) 个分类通道 + 1 个 offset 通道。
             cls_logits = output[:, :-1, :, :]
             offset = output[:, -1:, :, :]
             return cls_logits, offset
@@ -431,6 +458,7 @@ def draw_lanes(
     y_start: float = 0.333333,
     y_end: float = 1.0,
     line_width: int = 0,
+    row_y: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[int]]:
     """
     lanes:
@@ -449,12 +477,12 @@ def draw_lanes(
     )
     radius = max(thickness + 1, 3)
 
-    row_y = np.linspace(
-        float(y_end),
-        float(y_start),
-        row_anchors,
-        dtype=np.float32,
-    )
+    if row_y is None:
+        row_y = np.linspace(float(y_end), float(y_start), row_anchors, dtype=np.float32)
+    else:
+        row_y = np.asarray(row_y, dtype=np.float32).reshape(-1)
+        if row_y.size != row_anchors:
+            raise ValueError(f"row_y must contain {row_anchors} values, got {row_y.size}")
     y_pixels = np.clip(row_y, 0.0, 1.0) * max(height - 1, 1)
 
     active_lane_ids: list[int] = []
@@ -535,14 +563,15 @@ def save_prediction_txt(
     x_grids: int,
     y_start: float = 0.333333,
     y_end: float = 1.0,
+    row_y: np.ndarray | None = None,
 ) -> None:
     row_anchors, num_lanes = lanes.shape
-    row_y = np.linspace(
-        float(y_end),
-        float(y_start),
-        row_anchors,
-        dtype=np.float32,
-    )
+    if row_y is None:
+        row_y = np.linspace(float(y_end), float(y_start), row_anchors, dtype=np.float32)
+    else:
+        row_y = np.asarray(row_y, dtype=np.float32).reshape(-1)
+        if row_y.size != row_anchors:
+            raise ValueError(f"row_y must contain {row_anchors} values, got {row_y.size}")
     denominator = max(x_grids - 1, 1)
 
     lines: list[str] = []
@@ -647,6 +676,7 @@ def main() -> None:
     print(f"providers   : {session.get_providers()}")
     print(f"exist_thr   : {args.exist_thr}")
     print(f"topk        : {args.topk}")
+    print(f"letterbox   : {args.letterbox} (top/left/right black padding)")
     print(f"smoothing   : {not args.no_smooth}")
     print("=" * 72)
 
@@ -671,7 +701,11 @@ def main() -> None:
 
         try:
             rgb_image = load_image_rgb(image_path)
-            input_tensor = preprocess(rgb_image, input_hw)
+            input_tensor, letterbox_meta = preprocess_with_policy(
+                rgb_image,
+                input_hw,
+                letterbox=args.letterbox,
+            )
 
             outputs = session.run(
                 output_names,
@@ -691,12 +725,27 @@ def main() -> None:
             )
 
             lanes = lanes_batch[0]
+            result_row_y = None
+            if letterbox_meta is not None:
+                model_row_y = np.linspace(
+                    1.0,
+                    0.333333,
+                    lanes.shape[0],
+                    dtype=np.float32,
+                )
+                lanes, result_row_y = restore_lanes_from_letterbox(
+                    lanes,
+                    model_row_y,
+                    x_grids,
+                    letterbox_meta,
+                )
 
             drawn, active_lane_ids = draw_lanes(
                 rgb_image=rgb_image,
                 lanes=lanes,
                 x_grids=x_grids,
                 line_width=args.line_width,
+                row_y=result_row_y,
             )
 
             output_path.parent.mkdir(
@@ -720,6 +769,7 @@ def main() -> None:
                     txt_path=txt_path,
                     lanes=lanes,
                     x_grids=x_grids,
+                    row_y=result_row_y,
                 )
 
             lane_text = (

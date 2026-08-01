@@ -1793,7 +1793,7 @@ class LaneRobot(nn.Module):
 
     def __init__(
         self,
-        x_grids: int = 640,
+        x_grids: int = 320,
         row_anchors: int = 56,
         num_lanes: int = 2,
         reduce_channels: int = 8,
@@ -1857,7 +1857,7 @@ class LaneRobotV2(nn.Module):
 
     def __init__(
         self,
-        x_grids: int = 640,
+        x_grids: int = 320,
         row_anchors: int = 56,
         num_lanes: int = 2,
         reduce_channels: int = 8,
