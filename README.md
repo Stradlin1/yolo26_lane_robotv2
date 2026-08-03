@@ -1,20 +1,18 @@
-# ULTRALYTICS LANE ROBOT
+# YOLO26 Lane Robot V2 — 固定语义多线检测
 
-基于 Ultralytics YOLO26 改造的机器人场景多线检测项目。
+基于 Ultralytics YOLO26 与 UFLD/Row-Anchor 思路改造的机器人前视多线检测工程。
 
-> 更新日期：2026-08-01
+> 更新日期：2026-08-03  
+> 当前稳定方案：四个固定语义槽位、每个槽位最多一条曲线  
+> 当前部署目标：RDK X5 / OpenExplorer / NV12 Runtime
 
-本项目已经从原始的单线 Row-Anchor 检测，改造成**固定语义槽位的多线检测系统**。当前稳定主链路支持四种语义线，每种语义在一张图中最多对应一条曲线；训练、验证、预测、结果可视化和权重保存链路已经跑通。
-
-当前工作重点已从“能否输出多条线”转向：完整数据集质量、训练参数基线、逐槽位指标、曲线连续性和端侧部署。
+本项目已将原始单线 Lane Robot 改造成四槽位多线检测系统，训练、验证、PyTorch 推理、ONNX 导出与 ONNX Runtime 推理主链路已经跑通。RDK X5 Runtime BIN 已成功生成，但当前分类输出层仍因 BPU 维度限制回退到 CPU，属于 BPU + CPU 混合执行模型。
 
 ---
 
-## 1. 项目目标
+## 1. 模型解决什么问题
 
-机器人需要在不使用 BEV 的前提下，直接从前视图像中识别具有固定语义的多条线，并将结果用于后续运动控制。
-
-当前定义四个固定槽位：
+模型直接从机器人前视 RGB 图像中识别四种固定语义线，不依赖 BEV：
 
 | `lane_id` | 名称 | 语义 |
 |---:|---|---|
@@ -23,58 +21,51 @@
 | 2 | `channel_left` | 黄色通道左边界 |
 | 3 | `channel_right` | 黄色通道右边界 |
 
-当前模型属于：
+模型属于：
 
-> 固定四种语义、每种最多一条曲线的多线检测模型。
-
-它不是任意数量实例的曲线检测模型，也不是实例分割模型。
-
-### 当前能力边界
+> 固定四种语义、每种语义在一张图中最多一条曲线的多线检测模型。
 
 支持：
 
 - 每张图存在 0～4 条线。
 - 某个槽位整张图缺失。
-- 某条线只在部分纵向锚点可见。
-- 四槽位联合训练、验证与预测。
-- 分类网格、亚网格偏移、存在性、平滑性和曲率约束。
+- 某条线仅局部可见。
+- 用 `x=-1` 标记遮挡、断点或当前 Row Anchor 无有效点。
+- 四槽位联合训练、验证、解码、可视化和标签导出。
 
 暂不支持：
 
-- 同一张图中出现两条 `channel_left`。
-- 任意数量、未知语义的曲线实例。
+- 同一张图中出现两条相同语义线，例如两条 `channel_left`。
+- 任意数量的未知曲线实例。
 - Hungarian matching 或动态实例分配。
-- 完整的实例级拓扑建模。
-- 已完成部署验证的 polyline 输出分支。
+- 已完成闭环验证的 Polyline 实例头。
 
 ---
 
-## 2. 当前总体状态
+## 2. 当前工程状态
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| 单线改四槽位 | 已完成 | 数据、模型头和损失均支持四槽位 |
-| 真实标签读取 | 已验证 | 可构造 `[B, 56, 4]` 标签张量 |
-| 模型前向传播 | 已验证 | 分类与 offset 输出形状正确 |
-| 六项损失 | 已验证 | 可计算并完成 `loss.backward()` |
-| Trainer | 已验证 | 已完成真实数据 1 epoch 冒烟训练 |
-| Validator | 已验证 | 可完成验证与权重保存 |
-| Predictor | 已接通 | 可解码、画线、保存图片和 txt |
-| Resize / LetterBox | 已完成 | 可配置直接拉伸或顶部/左右补黑，标签与预测坐标同步变换 |
-| 多线水平翻转槽位交换 | 已实现/配置化 | `channel_left` 与 `channel_right` 需要同步交换 |
-| 完整数据集正式训练 | 进行中 | 需要先完成全量标签检查和无增强基线 |
+| 单线改四槽位 | 已完成 | Dataset、Head、Loss、Predictor 均支持四槽位 |
+| 标签读取 | 已验证 | 目标张量形状为 `[B, 56, 4]` |
+| 模型前向与反向 | 已验证 | 六项损失可计算并完成反向传播 |
+| Trainer / Validator | 已验证 | 可训练、验证并保存 `best.pt` / `last.pt` |
+| PyTorch Predictor | 已接通 | 可解码、绘图和保存预测 txt |
+| ONNX 导出 | 已完成 | Opset 11，当前合并输出 `[B, 322, 56, 4]` |
+| ONNX Runtime 推理 | 已完成 | 支持 CPU/CUDA Provider、Resize/LetterBox |
+| RDK X5 Runtime BIN | 已生成 | NV12 输入，当前为 BPU + CPU 混合执行 |
 | 逐槽位指标 | 待完成 | 当前总体指标可能掩盖单槽位失败 |
-| ONNX 端侧验证 | 部分完成 | 已进行导出/推理工作，运行环境仍需匹配 CUDA/cuDNN |
-| Polyline head | 实验阶段 | 已执行接入步骤，仍需完整训练、导出和精度验证 |
+| 严格断点绘制 | 待修正 | 当前 ONNX 绘图仍可能跨缺失 Anchor 连线 |
+| Polyline head | 实验阶段 | 尚未完成训练、导出和部署闭环 |
 
 ---
 
-## 3. 稳定主链路
+## 3. 稳定模型结构
 
 ```text
-图片
+输入图像
   ↓
-按配置直接 Resize，或保持比例并在顶部/左右 LetterBox
+Direct Resize 或自定义 LetterBox
   ↓
 YOLO26 Backbone
   ↓
@@ -84,213 +75,91 @@ LaneRobotV2 Head
   ├── cls:    [B, X+1, R, L]
   └── offset: [B, 1,   R, L]
   ↓
-Row-Anchor 解码
+Top-K soft-argmax + offset
   ↓
-四个固定语义槽位的曲线坐标
+固定四槽位曲线坐标
 ```
 
-默认参数：
+当前部署配置：
 
 ```text
-X = x_grids = 320
+X = x_grids    = 320
 R = row_anchors = 56
-L = num_lanes = 4
+L = num_lanes   = 4
 ```
 
-对应输出：
+PyTorch Head 输出：
 
 ```text
 cls:    [B, 321, 56, 4]
 offset: [B,   1, 56, 4]
 ```
 
-其中索引 `320` 是 `no-lane` 类，有效横向位置索引为 `0..319`。
+ONNX 合并输出：
+
+```text
+lane_output: [B, 322, 56, 4]
+```
+
+通道定义：
+
+```text
+0..319  : 320 个横向网格 logits
+320     : no-lane logit
+321     : 亚网格 offset
+```
+
+模型没有独立 confidence Head。点存在概率来自：
+
+```text
+existence = 1 - P(no-lane)
+```
 
 ---
 
-## 4. 已完成的核心代码改造
-
-### 4.1 新增 Lane 任务链路
-
-围绕 Ultralytics 框架接入了独立的 `lane` 任务，包括：
+## 4. 仓库关键文件
 
 ```text
+train_xhm.py                         正式训练入口
+export_onnx_xhm.py                   PT → ONNX Opset 11
+infer_onnx_xhm.py                    ONNX Runtime 图片推理
+check_empty_labels.py                空标签检查
+
+ultralytics/cfg/datasets/
+└── lane-robot.yaml                  数据路径、槽位和预处理配置
+
+ultralytics/cfg/models/26/
+├── yolo26n-lane.yaml
+├── yolo26s-lane.yaml
+├── yolo26m-lane.yaml
+└── yolo26x-lane.yaml
+
 ultralytics/models/yolo/lane/
 ├── dataset.py
+├── geometry.py
 ├── train.py
 ├── val.py
 ├── predict.py
-├── plotting.py
-└── __init__.py
+└── plotting.py
+
+Lane_Robot_RDK_X5_quantization_issues_and_solutions_2026-08-03.md
 ```
 
-同时修改了模型解析、任务注册、Loss 和配置系统，使 CLI/Python API 能识别：
+RDK X5 的完整量化记录、YAML 配置、错误分析和拆 Head 方案见：
 
-```bash
-task=lane
-```
-
-### 4.2 数据 YAML 控制多线维度
-
-最新设计中，数据 YAML 是以下参数的主要来源：
-
-```yaml
-x_grids: 320
-row_anchors: 56
-num_lanes: 4
-```
-
-Trainer 构建模型时将这些数据配置同步到模型头，并检查数据维度与模型输出是否一致，避免直到损失计算阶段才发现形状错误。
-
-### 4.3 LaneRobotV2 多尺度模型头
-
-在原始 Row-Anchor 头基础上增加：
-
-- P4 与 P5 多尺度特征融合。
-- 横向网格分类输出。
-- 亚网格 offset 回归输出。
-- 自适应池化，允许实验不同输入尺寸。
-
-模型配置位于：
-
-```text
-ultralytics/cfg/models/26/yolo26n-lane.yaml
-ultralytics/cfg/models/26/yolo26s-lane.yaml
-ultralytics/cfg/models/26/yolo26m-lane.yaml
-ultralytics/cfg/models/26/yolo26l-lane.yaml
-ultralytics/cfg/models/26/yolo26x-lane.yaml
-```
-
-### 4.4 六项训练损失
-
-当前训练日志包含：
-
-```text
-lane_ce
-lane_loc
-lane_exist
-lane_smooth
-lane_curv
-lane_offset
-```
-
-含义：
-
-| Loss | 作用 |
-|---|---|
-| `lane_ce` | 每个 Row Anchor 的横向网格分类与 no-lane 分类 |
-| `lane_loc` | soft-argmax 连续横坐标与标注坐标的定位误差 |
-| `lane_exist` | 强化可见点与 no-lane 的区分 |
-| `lane_smooth` | 约束相邻纵向锚点的一阶连续性 |
-| `lane_curv` | 约束二阶变化，减少不合理折线和抖动 |
-| `lane_offset` | 学习网格内亚像素/亚网格偏移 |
-
-### 4.5 Predictor 与结果对象
-
-预测链路已扩展为：
-
-```text
-模型原始输出
-→ decode_lane()
-→ [56, 4] 曲线坐标
-→ LaneResults
-→ 绘制结果
-→ 保存图片
-→ 保存预测 txt
-```
-
-结果对象支持的目标接口包括：
-
-```python
-result.lanes
-result.row_y
-result.active_lane_ids
-result.verbose()
-result.plot()
-result.save()
-result.save_txt()
-```
-
-### 4.6 训练与推理预处理对齐
-
-支持两种互斥模式，训练、验证、PyTorch 推理和 ONNX 推理必须选择相同模式：
-
-```yaml
-# false：直接拉伸到 320x320
-# true：保持宽高比，纵向余量全部补在顶部，横向余量在左右居中
-letterbox: false
-letterbox_color: [0, 0, 0]
-letterbox_bottom_align: true
-```
-
-启用 LetterBox 后，图片底部保持与模型输入底部对齐。标签会使用同一个缩放和平移矩阵变换，并重新采样到目标 56 个 row anchors；落在黑边或画面外的点变为 no-lane。预测结果会执行逆变换后再绘制或保存到原图，避免 padding 引起系统性偏移。
-
-### 4.7 多线几何增强与水平翻转
-
-几何增强不能只变换图像，还必须同步变换：
-
-```text
-lane_x
-lane_y
-有效性标记
-lane_id 固定语义槽位
-```
-
-水平翻转时需要：
-
-```text
-x → 1 - x
-channel_left ↔ channel_right
-lane_id 2 ↔ lane_id 3
-```
-
-对应配置：
-
-```yaml
-flip_lane_pairs:
-  - [2, 3]
-```
-
-该映射只在训练阶段实际触发水平翻转时生效，即：
-
-```yaml
-fliplr: 大于 0
-```
-
-若 `fliplr: 0.0`，即使保留 `flip_lane_pairs`，也不会执行槽位交换。
-
-不配置映射却开启水平翻转，会导致图像左右反转，但标签仍保持原语义，从而污染 `channel_left` 和 `channel_right` 的监督信号。
-
-### 4.8 Polyline head 实验分支
-
-已经执行 polyline head 接入步骤，涉及：
-
-```text
-ultralytics/nn/modules/head.py
-ultralytics/nn/modules/__init__.py
-ultralytics/nn/tasks.py
-ultralytics/cfg/models/26/yolo26n-lane-polyline.yaml
-```
-
-该方向用于直接回归或辅助表达更连续的曲线，解决通道拐角、横向边界和 Row Anchor 表达能力不足的问题。
-
-目前应视为实验分支：
-
-- 接入代码已开始。
-- 尚不能替代稳定的 LaneRobotV2 主链路。
-- 仍需 Dataset target、Loss、Trainer、Predictor、ONNX 导出和精度对比的完整闭环验证。
+[Lane Robot RDK X5 量化问题与解决思路](Lane_Robot_RDK_X5_quantization_issues_and_solutions_2026-08-03.md)
 
 ---
 
-## 5. 数据集目录
+## 5. 数据集结构
 
-当前本地项目根目录：
+默认本地项目路径：
 
 ```text
 /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT
 ```
 
-推荐数据集结构：
+数据目录：
 
 ```text
 datasets/
@@ -309,13 +178,10 @@ datasets/images/train/abc.jpg
 datasets/labels_corrected/train/abc.txt
 ```
 
-由于默认 Ultralytics 映射通常是 `images → labels`，使用 `labels_corrected` 时应在数据 YAML 中显式配置标签路径，不能依赖默认映射。
-
-示例：
+当前 `ultralytics/cfg/datasets/lane-robot.yaml` 已显式配置：
 
 ```yaml
 path: /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/datasets
-
 train: images/train
 val: images/valid
 
@@ -325,13 +191,14 @@ val_labels: labels_corrected/valid
 x_grids: 320
 row_anchors: 56
 num_lanes: 4
-
 y_start: 0.333333
 y_end: 1.0
 
-channels: 3
-nc: 4
+letterbox: false
+letterbox_color: [0, 0, 0]
+letterbox_bottom_align: true
 
+nc: 4
 names:
   0: lane_follow
   1: lead_lane
@@ -342,17 +209,25 @@ flip_lane_pairs:
   - [2, 3]
 ```
 
+`num_lanes` 决定 Lane Head 的固定槽位数量；`x_grids` 决定横向分类网格数量。模型 YAML 中可能存在用于框架兼容的 `nc` 字段，判断实际 Lane 输出时应查看：
+
+```text
+LaneRobotV2 [320, 56, 4, ...]
+```
+
+以及实际输出形状，而不是只看某一个 YAML 字段。
+
 ---
 
 ## 6. 标签格式
 
-每一行表示一个固定槽位中的一条曲线：
+每一行表示一个固定语义槽位：
 
 ```text
 lane_id x1 y1 x2 y2 ... x56 y56
 ```
 
-每行共有：
+每行应有：
 
 ```text
 1 + 56 × 2 = 113
@@ -363,273 +238,57 @@ lane_id x1 y1 x2 y2 ... x56 y56
 规则：
 
 - `lane_id` 只能是 `0、1、2、3`。
-- 同一个标签文件中，同一个 `lane_id` 最多出现一次。
-- `x` 为归一化横坐标，正常范围为 `[0, 1]`。
-- `x=-1` 表示该纵向锚点没有有效点。
+- 同一标签文件中，同一个 `lane_id` 最多出现一次。
+- `x` 为归一化横坐标，正常范围 `[0, 1]`。
+- `x=-1` 表示该 Row Anchor 没有有效点。
 - `y` 为归一化纵坐标。
-- 某条线整张图不存在时，可不写该 `lane_id`。
-- 某条线局部可见时，保留该行，不可见位置写 `x=-1`。
-- 一张图片不要求同时存在四条线。
+- 某条线整张图不存在时，可省略该 `lane_id` 行。
+- 某条线中间被遮挡时，遮挡区对应 Anchor 的 `x` 写成 `-1`，前后可见部分继续保留坐标。
 
-示例：某张图只有黄色通道左右边界：
+例如一张图只有左右通道边界：
 
 ```text
 2 x1 y1 x2 y2 ... x56 y56
 3 x1 y1 x2 y2 ... x56 y56
 ```
 
-### Row Anchor 顺序
-
-当前标签的 56 个纵向锚点按以下方向排列：
+56 个纵向锚点顺序为：
 
 ```text
 1.000000 → 0.333333
 ```
 
-即从图像底部向上。
-
-空标签或自动生成默认 `row_y` 时，也必须保持同样顺序：
+即从图像底部向上。默认 Anchor 生成必须使用：
 
 ```python
 np.linspace(y_end, y_start, row_anchors)
 ```
 
-不能生成相反方向，否则预测曲线与图像纵向位置会错位。
+---
+
+## 7. 遮挡、断点与绘制现状
+
+训练标签可以通过 `x=-1` 表达真实断点。解码时，no-lane 概率超过阈值的点也会被恢复为 `-1`。
+
+但当前 `infer_onnx_xhm.py` 的绘图逻辑会：
+
+1. 跳过无效 Anchor；
+2. 收集该槽位所有有效点；
+3. 对全部有效点调用一次 `cv2.polylines()`。
+
+因此，当一条线中间存在一段 `-1` 时，当前可视化仍可能把遮挡前后的两段跨空白连接起来。该问题属于绘图/后处理表达问题，不等于模型一定没有学到 no-lane。
+
+严格保留断点时，应采用以下任一方式：
+
+- 仅绘制点，不调用 `cv2.polylines()`；
+- 按连续有效 Anchor 分段，每段分别画折线；
+- 当相邻有效 Anchor 的索引差或像素距离超过阈值时强制断开。
+
+部署控制层也不应把跨越大段无效 Anchor 的点直接拟合成一条连续曲线。
 
 ---
 
-## 7. `nc`、`num_lanes` 与模型 YAML
-
-这是当前项目中最容易混淆的配置。
-
-### 7.1 真正决定输出线槽位数量的是 `num_lanes`
-
-```yaml
-num_lanes: 4
-```
-
-最终模型输出最后一维应为 4。
-
-### 7.2 `nc` 不是 Row-Anchor 横向分类数
-
-横向分类数由：
-
-```yaml
-x_grids: 320
-```
-
-决定，模型内部会额外增加一个 no-lane 类，因此分类维度为 321。
-
-### 7.3 为什么模型 YAML 中可能仍看到 `nc: 1`
-
-Lane 任务沿用了部分 Ultralytics 通用模型配置字段，`nc` 在模型 YAML 中可能只是框架兼容占位值，不等于四个 Lane 槽位。
-
-对于最新改造，应以数据 YAML 中的以下字段为准：
-
-```yaml
-num_lanes: 4
-names:
-  0: lane_follow
-  1: lead_lane
-  2: channel_left
-  3: channel_right
-```
-
-判断是否真正生效，不要只看 YAML 文本，应查看模型构建日志：
-
-```text
-LaneRobotV2 [320, 56, 4, ...]
-```
-
-以及前向输出：
-
-```text
-cls:    [B, 321, 56, 4]
-offset: [B, 1, 56, 4]
-```
-
----
-
-## 8. 配置来源与修改位置
-
-训练参数可能来自多个位置，优先级必须明确。
-
-### 8.1 推荐做法
-
-将项目固定配置写入专用数据 YAML 和训练 YAML，训练命令只覆盖本次实验变化。
-
-主要位置：
-
-```text
-ultralytics/cfg/default.yaml
-ultralytics/cfg/datasets/lane-robot.yaml
-ultralytics/cfg/models/26/yolo26n-lane.yaml
-train.py
-CLI 参数
-```
-
-一般情况下，显式 CLI 参数或 `model.train(...)` 参数会覆盖默认配置。
-
-### 8.2 关闭所有训练增强
-
-建立基线时建议显式设置：
-
-```yaml
-hsv_h: 0.0
-hsv_s: 0.0
-hsv_v: 0.0
-
-degrees: 0.0
-translate: 0.0
-scale: 0.0
-shear: 0.0
-perspective: 0.0
-
-flipud: 0.0
-fliplr: 0.0
-
-mosaic: 0.0
-mixup: 0.0
-cutmix: 0.0
-copy_paste: 0.0
-erasing: 0.0
-```
-
-只修改 `default.yaml` 并不保证一定生效；还需要检查：
-
-- 根目录 `train.py` 是否传入覆盖参数。
-- CLI 命令是否覆盖。
-- Dataset 是否自行实现几何增强。
-- 旧实验是否通过 `resume` 读取了原训练参数。
-
-### 8.3 当前推荐无几何增强基线
-
-考虑黄色通道与绿色外部区域的颜色语义，建议先用：
-
-```yaml
-degrees: 0.0
-translate: 0.0
-scale: 0.0
-shear: 0.0
-perspective: 0.0
-
-fliplr: 0.0
-flipud: 0.0
-
-mosaic: 0.0
-mixup: 0.0
-cutmix: 0.0
-copy_paste: 0.0
-
-hsv_h: 0.0
-hsv_s: 0.05
-hsv_v: 0.10
-```
-
-在基线稳定后，再逐项加入轻微平移、缩放和旋转，不能一次打开所有增强。
-
-### 8.4 当前训练配置基线
-
-当前仓库的默认训练基线面向 `320x320` 输入、四语义槽位、多线 Row-Anchor 检测。建议先使用该配置完成无增强基线训练，再讨论是否加入几何增强或切换 LetterBox。
-
-核心配置：
-
-```yaml
-task: lane
-model: ultralytics/cfg/models/26/yolo26n-lane.yaml
-data: ultralytics/cfg/datasets/lane-robot.yaml
-imgsz: 320
-
-x_grids: 320
-row_anchors: 56
-num_lanes: 4
-y_start: 0.333333
-y_end: 1.0
-
-letterbox: false
-letterbox_color: [0, 0, 0]
-letterbox_bottom_align: true
-
-flip_lane_pairs:
-  - [2, 3]
-```
-
-对应 `default.yaml` 中的 LaneRobot 参数：
-
-```yaml
-lane_x_grids: 320
-lane_row_anchors: 56
-lane_num_lanes: 4
-lane_y_start: 0.333333
-lane_y_end: 1.0
-lane_letterbox: false
-lane_letterbox_color: [0, 0, 0]
-lane_letterbox_bottom_align: true
-
-lane_ce: 1.0
-lane_loc: 2.0
-lane_exist: 1.5
-lane_smooth: 0.03
-lane_curv: 0.02
-lane_offset: 3.0
-lane_label_smoothing: 0.0
-lane_soft_label: true
-lane_soft_sigma: 1.0
-lane_softargmax_topk: 5
-lane_exist_thr: 0.5
-
-lane_post_smooth: true
-lane_poly_degree: 2
-lane_poly_blend: 0.5
-```
-
-当前预处理默认是直接拉伸到 `320x320`，即：
-
-```yaml
-letterbox: false
-```
-
-如果要训练保持比例、顶部和左右补黑边的模型，应在数据 YAML 中改为：
-
-```yaml
-letterbox: true
-letterbox_color: [0, 0, 0]
-letterbox_bottom_align: true
-```
-
-同一组权重的训练、验证、PyTorch 推理和 ONNX 推理必须使用同一种预处理策略。直接 Resize 训练得到的权重不要用 LetterBox 推理；LetterBox 训练得到的 ONNX 模型推理时需要加 `--letterbox`。
-
-当前建议的无增强训练超参：
-
-```yaml
-epochs: 100
-batch: 8
-workers: 4
-device: 0
-lr0: 0.0003
-lrf: 0.01
-weight_decay: 0.01
-warmup_epochs: 3.0
-
-degrees: 0.0
-translate: 0.0
-scale: 0.0
-shear: 0.0
-perspective: 0.0
-fliplr: 0.0
-flipud: 0.0
-mosaic: 0.0
-mixup: 0.0
-cutmix: 0.0
-copy_paste: 0.0
-erasing: 0.0
-
-hsv_h: 0.0
-hsv_s: 0.05
-hsv_v: 0.10
-```
-
-训练环境使用仓库对应的 Conda 环境：
+## 8. 环境安装
 
 ```bash
 conda activate lane_robot
@@ -637,21 +296,7 @@ cd /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT
 pip install -e .
 ```
 
----
-
-## 9. 训练
-
-### 9.1 环境安装
-
-建议在项目虚拟环境中以 editable 方式安装当前源码：
-
-```bash
-conda activate lane_robot
-cd /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT
-pip install -e .
-```
-
-确认当前导入的是本仓库，而不是系统中另一个 Ultralytics：
+确认导入的是当前仓库：
 
 ```bash
 python -c "import ultralytics; print(ultralytics.__file__)"
@@ -663,82 +308,130 @@ python -c "import ultralytics; print(ultralytics.__file__)"
 /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/ultralytics/
 ```
 
-### 9.2 无增强基线训练
+---
 
-```bash
-conda activate lane_robot
-cd /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT
+## 9. 训练
 
-yolo task=lane mode=train \
-  model=ultralytics/cfg/models/26/yolo26n-lane.yaml \
-  data=ultralytics/cfg/datasets/lane-robot.yaml \
-  epochs=100 \
-  batch=8 \
-  imgsz=320 \
-  workers=4 \
-  device=0 \
-  lr0=0.0003 \
-  lrf=0.01 \
-  weight_decay=0.01 \
-  warmup_epochs=3.0 \
-  degrees=0.0 \
-  translate=0.0 \
-  scale=0.0 \
-  shear=0.0 \
-  perspective=0.0 \
-  fliplr=0.0 \
-  flipud=0.0 \
-  mosaic=0.0 \
-  mixup=0.0 \
-  cutmix=0.0 \
-  copy_paste=0.0 \
-  erasing=0.0 \
-  hsv_h=0.0 \
-  hsv_s=0.05 \
-  hsv_v=0.10 \
-  project=/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/runs/lane \
-  name=baseline_no_aug
-```
+### 9.1 当前 `train_xhm.py` 的真实默认值
 
-显存不足时优先降低：
+当前仓库脚本默认：
 
 ```text
-batch
-imgsz
-模型尺寸（m → s → n）
+model       = yolo26s-lane.yaml
+imgsz       = [256, 320]
+epochs      = 1000
+batch       = 8
+optimizer   = AdamW
+lr0         = 3e-4
 ```
 
-### 9.3 训练日志检查
+并且 `AUGMENTATION_CONFIG` 当前不是“全关闭”：
 
-启动训练后必须确认：
+```text
+hsv_h    = 0.005
+hsv_s    = 0.15
+hsv_v    = 0.15
+degrees  = 2.0
+fliplr   = 0.3
+```
+
+其中水平翻转会通过：
+
+```yaml
+flip_lane_pairs:
+  - [2, 3]
+```
+
+同步交换 `channel_left` 和 `channel_right`。
+
+如果要建立严格无增强基线，需要先修改 `train_xhm.py` 中的 `AUGMENTATION_CONFIG`，将颜色和几何增强显式设为 0。当前脚本没有为每个增强项单独提供 CLI 参数。
+
+### 9.2 直接运行当前训练配置
+
+```bash
+python train_xhm.py \
+  --name lane_s_current \
+  --epochs 1000 \
+  --patience 100 \
+  --batch 8
+```
+
+### 9.3 面向当前 320×320 ONNX / RDK 部署的训练
+
+当前 ONNX 导出和 RDK X5 量化基线使用静态 `320×320` 输入，因此建议训练时也明确指定：
+
+```bash
+python train_xhm.py \
+  --img-height 320 \
+  --img-width 320 \
+  --name lane_s_320 \
+  --epochs 1000 \
+  --patience 100 \
+  --batch 8
+```
+
+必须保持以下环节一致：
+
+```text
+训练预处理
+→ PyTorch 验证/推理
+→ ONNX 导出输入尺寸
+→ ONNX Runtime 预处理
+→ 量化校准预处理
+→ RDK 板端预处理
+```
+
+不要用 `256×320` 训练权重，在未验证自适应池化和坐标映射影响的情况下直接按 `320×320` 量化部署。
+
+### 9.4 训练日志检查
+
+训练启动后应确认：
 
 ```text
 LaneRobotV2 [320, 56, 4, ...]
 ```
 
-以及日志中存在六项 Loss：
+并看到六项损失：
 
 ```text
-lane_ce lane_loc lane_exist lane_smooth lane_curv lane_offset
+lane_ce
+lane_loc
+lane_exist
+lane_smooth
+lane_curv
+lane_offset
 ```
-
-如果模型日志仍显示 `num_lanes=1`，不要继续长时间训练，应先检查数据 YAML、Trainer 覆盖逻辑和实际导入的源码路径。
 
 ---
 
-## 10. 验证与预测
+## 10. 验证与 PyTorch 推理
 
-### 10.1 验证
+验证：
 
 ```bash
 yolo task=lane mode=val \
-  model=/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/runs/lane/baseline_no_aug/weights/best.pt \
+  model=runs/lane/lane_s_320/weights/best.pt \
   data=ultralytics/cfg/datasets/lane-robot.yaml \
   imgsz=320 \
   device=0
 ```
 
-当前 Validator 主要提供整体指标，例如：
+预测：
+
+```bash
+yolo task=lane mode=predict \
+  model=runs/lane/lane_s_320/weights/best.pt \
+  source=datasets/images/valid \
+  imgsz=320 \
+  device=0 \
+  save=True \
+  save_txt=True \
+  project=runs/lane \
+  name=predict_lane_s_320 \
+  exist_ok=True
+```
+
+当前 Validator 主要输出总体指标，例如：
 
 ```text
 MAE
@@ -749,7 +442,275 @@ Acc@5
 Exist
 ```
 
-后续应增加：
+后续应增加每个槽位独立的 MAE、Exist、漏检率和左右边界混淆统计。
+
+---
+
+## 11. ONNX 导出
+
+`export_onnx_xhm.py` 默认：
+
+```text
+input        = float32 [1, 3, 320, 320]
+output       = float32 [1, 322, 56, 4]
+opset        = 11
+static batch = 1
+```
+
+导出并执行 ONNX Runtime 校验：
+
+```bash
+conda run -n lane_robot python export_onnx_xhm.py \
+  --weights runs/lane/lane_s_320/weights/best.pt \
+  --output runs/lane/lane_s_320/weights/best.onnx \
+  --imgsz 320 320 \
+  --verify-runtime
+```
+
+脚本默认要求 `x_grids=320`，用于防止误把旧的 160-grid 权重当成当前模型导出。只有明确处理旧模型时才使用：
+
+```bash
+--allow-legacy-x-grids
+```
+
+---
+
+## 12. ONNX Runtime 推理
+
+```bash
+conda run -n lane_robot python infer_onnx_xhm.py \
+  --model runs/lane/lane_s_320/weights/best.onnx \
+  --source test \
+  --output test_infer \
+  --save-txt \
+  --overwrite
+```
+
+主要后处理参数：
+
+```text
+exist_thr   = 0.5
+topk        = 5
+poly_degree = 2
+poly_blend  = 0.5
+offset clip = [-0.5, 0.5]
+```
+
+默认预处理：
+
+```text
+EXIF 修正
+→ RGB
+→ INTER_LINEAR 直接 Resize
+→ float32 / 255
+→ HWC 转 CHW
+→ 增加 Batch
+```
+
+只有使用 LetterBox 训练的权重才应在推理时添加：
+
+```bash
+--letterbox
+```
+
+若出现：
+
+```text
+Failed to load library libonnxruntime_providers_cuda.so
+libcudnn.so.9: cannot open shared object file
+```
+
+说明 ONNX Runtime GPU 包与本机 CUDA/cuDNN 不匹配，不是模型输出结构错误。可先使用：
+
+```bash
+--device cpu
+```
+
+验证模型和后处理。
+
+---
+
+## 13. RDK X5 量化与部署状态
+
+当前量化环境：
+
+```text
+OpenExplorer
+hb_mapper 1.24.3
+hbdk 3.49.15
+march = bayes-e
+Runtime input = NV12
+```
+
+已经确认的 ONNX 输入输出：
+
+```text
+images      [1, 3, 320, 320] float32 NCHW
+lane_output [1, 322, 56, 4] float32
+```
+
+量化训练输入语义：
+
+```yaml
+input_type_train: rgb
+input_layout_train: NCHW
+norm_type: data_scale
+scale_value: 0.003921568627451
+```
+
+NV12 Runtime 输入不能配置为普通 DDR 输入源。删除 `input_source` 让工具链自动推导，或显式配置为 pyramid。
+
+### 13.1 已解决
+
+- ONNX Opset 11 模型可被工具链读取。
+- NV12 Runtime 输入配置通过。
+- 注意力 Softmax 可通过 `node_info` 指定到 BPU。
+- Runtime BIN 已成功生成。
+- offset 分支可运行在 BPU INT8。
+
+### 13.2 当前核心限制
+
+分类层：
+
+```text
+/model/model.16/cls_fc2/Gemm
+```
+
+一次性输出：
+
+```text
+321 × 56 × 4 = 71904
+```
+
+当前 BPU 相关维度上限为：
+
+```text
+65536
+```
+
+因此：
+
+```text
+71904 > 65536
+```
+
+该大 `Gemm` 无法进入 BPU，只能回退到 CPU float。
+
+当前执行结构近似为：
+
+```text
+NV12 输入
+→ Backbone：BPU INT8
+→ Attention Softmax：BPU
+→ cls_fc2：CPU float
+→ offset_fc：BPU INT8
+→ Reshape / Concat：CPU
+→ lane_output [1, 322, 56, 4]
+```
+
+### 13.3 当前推荐路线
+
+第一阶段先使用混合模型完成：
+
+- 板端加载与输出检查。
+- C++ 后处理。
+- 精度对比。
+- `hb_perf` 和真实端到端 FPS 测试。
+- CPU 占用与 BPU/CPU 数据搬运开销测试。
+
+如果分类 Head 成为明显瓶颈，再把一个大 Linear 真正拆成两个：
+
+```text
+cls_fc2_01: 321 × 56 × 2 = 35952
+cls_fc2_23: 321 × 56 × 2 = 35952
+offset_fc : 1 × 56 × 4   = 224
+```
+
+推荐新 ONNX 输出：
+
+```text
+cls_01 [1, 321, 56, 2]
+cls_23 [1, 321, 56, 2]
+offset [1,   1, 56, 4]
+```
+
+只在旧大 `Gemm` 后增加 `Split` 无效，必须在 PyTorch Head 中创建两个较小的 Linear/Gemm，并正确迁移旧权重。
+
+---
+
+## 14. 数据增强注意事项
+
+通道左右边界具有固定语义，几何增强必须同时变换：
+
+```text
+图像
+lane_x
+lane_y
+有效性标记
+固定槽位 lane_id
+```
+
+水平翻转必须执行：
+
+```text
+x → 1 - x
+channel_left ↔ channel_right
+lane_id 2 ↔ lane_id 3
+```
+
+Mosaic、MixUp、CutMix、Copy-Paste 会破坏连续通道结构，当前训练脚本保持关闭。
+
+颜色对黄色通道与绿色背景具有语义，HSV 增强不应过强。正式实验应保存每次运行的完整参数，不要只依赖默认值。
+
+---
+
+## 15. 正式训练前的数据检查
+
+至少检查：
+
+- 图片是否都有对应标签。
+- 标签是否都有对应图片。
+- `lane_id` 是否只在 `0～3`。
+- 同一文件是否重复出现同一 `lane_id`。
+- 每行是否正好包含 56 对坐标。
+- `x` 是否为 `-1` 或 `[0, 1]`。
+- 所有标签是否使用一致的 56 个 `y`。
+- Row Anchor 顺序是否为底部到上方。
+- 是否存在空文件、损坏图片、NaN 或非法文本。
+- 四个槽位的图片数和有效 Anchor 数是否严重失衡。
+
+代码能正常训练，不代表缺失槽位或极少样本槽位能被模型学会。
+
+---
+
+## 16. 当前已知配置风险
+
+1. `train_xhm.py` 当前默认输入为 `256×320`，而 ONNX/RDK 基线为 `320×320`。
+2. `train_xhm.py` 当前启用了轻微 HSV、旋转和水平翻转，并非无增强基线。
+3. `infer_onnx_xhm.py` 的默认权重路径仍指向特定历史实验目录，正式使用应显式传 `--model`。
+4. 当前 ONNX 绘图会把同一槽位所有有效点一次性连成折线，可能跨遮挡区连接。
+5. 当前 RDK BIN 不是全 BPU 模型，分类大 `Gemm` 位于 CPU。
+6. 当前总体验证指标不足以确认每个固定语义槽位都学会。
+
+---
+
+## 17. 下一步工作顺序
+
+### P0：冻结可复现基线
+
+- 固定输入尺寸和预处理策略。
+- 固定数据划分和随机种子。
+- 保存完整训练参数、代码提交、日志与权重。
+
+### P1：数据质量与逐槽位统计
+
+- 全量标签检查。
+- 统计四槽位样本数和有效点数。
+- 可视化训练输入经过增强后的真实标签。
+
+### P2：增加逐槽位指标
+
+至少增加：
 
 ```text
 lane_follow/MAE
@@ -757,379 +718,64 @@ lead_lane/MAE
 channel_left/MAE
 channel_right/MAE
 
-lane_follow/Exist
-lead_lane/Exist
-channel_left/Exist
-channel_right/Exist
+每槽位 Exist / Miss / False Positive
+左右边界混淆率
 ```
 
-### 10.2 PyTorch 预测
+### P3：修正断点绘制与控制输入
 
-```bash
-yolo task=lane mode=predict \
-  model=/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/runs/lane/baseline_no_aug/weights/best.pt \
-  source=/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/datasets/images/valid \
-  imgsz=320 \
-  device=0 \
-  save=True \
-  save_txt=True \
-  project=/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/runs/lane \
-  name=predict_baseline \
-  exist_ok=True
-```
+- 推理可视化改为点模式或连续段模式。
+- 控制层禁止跨大段 no-lane 拟合。
+- 对遮挡前后段分别评估稳定性。
 
-预测 txt 与训练标签使用同一种固定槽位格式。
+### P4：RDK 板端实测
+
+- 完成 C++ Softmax、Top-K soft-argmax、offset 和坐标恢复。
+- 测试 Runtime BIN 的精度、FPS、CPU 和 BPU 占用。
+- 再决定是否拆分分类 Head。
+
+### P5：实验 Polyline Head
+
+在相同数据和预处理条件下，对比：
+
+- 当前 Row-Anchor Head。
+- Row-Anchor + 分段后处理。
+- Polyline Head。
+
+重点比较转角、横向边界、遮挡断点、量化损失和端侧延迟。
 
 ---
 
-## 11. ONNX 导出与推理
+## 18. 检测输出到机器人控制
 
-项目已经开展 PT → ONNX 导出和 ONNX Runtime 推理适配工作。
-
-当前 `x_grids=320` 模型的 ONNX 合并输出为 `[B, 322, 56, 4]`：前
-321 个通道是分类 logits（索引 320 为 no-lane），最后 1 个通道是
-offset。导出与推理脚本默认都会校验 `x_grids=320`，防止把旧的 160-grid
-模型误当成当前模型使用。
-
-```bash
-conda run -n lane_robot python export_onnx_xhm.py \
-  --weights runs/lane/lane_n_baseline-4/weights/best.pt \
-  --output runs/lane/lane_n_baseline-4/weights/best.onnx \
-  --verify-runtime
-
-conda run -n lane_robot python infer_onnx_xhm.py \
-  --model runs/lane/lane_n_baseline-4/weights/best.onnx \
-  --source test \
-  --output test_infer
-```
-
-如需有意导出或推理旧的 `x_grids=160` 模型，两个脚本都必须显式添加
-`--allow-legacy-x-grids`。
-
-关键要求：
-
-- ONNX 输入预处理必须与训练保持一致：直接 Resize 模型不加参数，LetterBox 模型使用 `infer_onnx_xhm.py --letterbox`。
-- 明确输出中 `cls` 与 `offset` 的拼接或多输出形式。
-- 解码时使用相同的 `x_grids`、`row_anchors`、`num_lanes` 和存在性阈值。
-- 保存结果时恢复到原图尺寸。
-
-遇到以下错误：
-
-```text
-Failed to load library libonnxruntime_providers_cuda.so
-libcudnn.so.9: cannot open shared object file
-```
-
-表示 ONNX Runtime GPU 包要求的 CUDA/cuDNN 版本与本机环境不匹配，不是模型结构本身报错。
-
-临时验证可切换 CPU Provider；正式 GPU 部署应安装与当前 CUDA、cuDNN 对应的 `onnxruntime-gpu` 版本。
-
----
-
-## 12. 已完成的辅助数据工具
-
-项目过程中已经设计或生成以下类型的脚本：
-
-- 标签格式检查。
-- 图片与标签同名匹配检查。
-- 从图片目录中筛选没有对应标签的图片。
-- 两个或多个数据集的合并与移动。
-- 按命名顺序执行 9:1 的 train/valid 划分。
-- 从已有标签集合提取对应原图。
-- 标签可视化并保存到 `labelview`。
-- 56 Anchor 手工标注与修正工具。
-- 无原始标签时从空白状态开始标注。
-- 标注窗口、文字尺寸和控制点半径优化。
-- PT 转 ONNX 与 ONNX 推理脚本。
-
-这些工具的路径和版本需要在最终整理仓库时统一放入：
-
-```text
-scripts/
-├── dataset/
-├── annotation/
-├── visualization/
-└── deployment/
-```
-
-并补充统一命令说明。目前部分脚本可能位于项目外部或尚未包含在“仅代码”压缩包中。
-
----
-
-## 13. 已完成验证
-
-### 13.1 真实数据读取
-
-已验证批次形状：
-
-```text
-batch img:    [2, 3, 320, 320]
-batch lane:   [2, 56, 4]
-batch lane_x: [2, 56, 4]
-batch lane_y: [2, 56]
-```
-
-### 13.2 模型输出
-
-已验证：
-
-```text
-cls:    [2, 321, 56, 4]
-offset: [2, 1, 56, 4]
-```
-
-### 13.3 训练闭环
-
-已完成：
-
-```text
-真实 YAML
-→ 真实标签
-→ LaneRobotDataset
-→ 四槽位模型
-→ 六项损失
-→ backward
-→ optimizer
-→ Trainer
-→ Validator
-→ best.pt / last.pt
-```
-
-### 13.4 预测闭环
-
-已完成：
-
-```text
-best.pt
-→ yolo task=lane mode=predict
-→ 多槽位解码
-→ 可视化图片
-→ 预测 txt
-```
-
-早期 1 epoch 或极少数据训练只用于验证代码链路，不代表模型已经具备实际精度。
-
----
-
-## 14. 当前数据问题与训练风险
-
-### 14.1 类别/槽位不平衡
-
-早期测试数据曾出现：
-
-```text
-lane_follow:   0
-lead_lane:     0
-channel_left:  少量
-channel_right: 少量
-```
-
-在这种数据上，代码可以正常训练，但模型不可能学会缺失的槽位。
-
-正式训练前必须统计：
-
-- 每个槽位出现的图片数。
-- 每个槽位有效 Anchor 点数量。
-- 每张图平均可见线数。
-- 各场景、光照、转角和遮挡分布。
-
-### 14.2 标签一致性
-
-必须检查：
-
-- 图片是否都有对应标签。
-- 标签是否都有对应图片。
-- `lane_id` 是否只在 `0～3`。
-- 同一文件是否重复出现同一个 `lane_id`。
-- 每行是否正好包含 56 对坐标。
-- `x` 是否为 `-1` 或 `[0, 1]`。
-- 所有标签是否使用相同的 56 个 `y`。
-- `row_y` 顺序是否一致。
-- 是否存在损坏图片、空文本和非法数值。
-
-### 14.3 数据增强污染
-
-本项目中的左右边界具有明确语义，几何增强错误会直接制造错误标签。
-
-如果需要定位训练结果突然变差，应优先做以下对照：
-
-1. 完全关闭所有增强。
-2. 固定随机种子和数据划分。
-3. 可视化 Dataset 送入模型前的图片与标签。
-4. 比较直接 Resize 与 LetterBox 后的标签位置。
-5. 单独开启一种增强，观察可视化结果。
-
----
-
-## 15. 当前压缩包与配置注意事项
-
-历史代码压缩包中可能仍保留旧配置，例如：
-
-```text
-/home/baater/ultralytics/...
-num_lanes: 1
-y_start: 0.67
-```
-
-这些值不应直接用于当前四槽位数据集。
-
-当前本地环境应统一为：
-
-```text
-项目根目录：/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT
-数据根目录：/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/datasets
-num_lanes: 4
-y_start: 0.333333
-y_end: 1.0
-```
-
-每次训练前建议打印实际加载后的配置，而不是只查看某一个 YAML 文件。
-
----
-
-## 16. 下一步工作顺序
-
-### P0：冻结稳定主链路
-
-- 不再频繁修改基础 LaneRobotV2 结构。
-- 对当前可训练版本建立 Git tag 或明确提交。
-- 将 polyline 分支与稳定分支分开。
-
-### P1：完成数据闭环
-
-- 合并所有已标注数据。
-- 按命名顺序完成 train/valid 划分。
-- 全量执行标签检查。
-- 统计四槽位分布。
-- 随机可视化并人工抽查。
-
-### P2：训练无增强基线
-
-- 关闭全部几何增强。
-- 使用固定数据划分和固定随机种子。
-- 保存配置、日志、权重和预测可视化。
-- 不使用 1 epoch 结果判断精度。
-
-### P3：增加逐槽位指标
-
-重点防止总体指标掩盖：
-
-- 某个槽位完全不输出。
-- 左右边界混淆。
-- 只学习样本最多的槽位。
-
-### P4：逐项加入安全增强
-
-建议顺序：
-
-1. 轻微亮度变化。
-2. 轻微平移。
-3. 轻微缩放。
-4. 极小角度旋转。
-5. 最后测试带 `flip_lane_pairs` 的水平翻转。
-
-### P5：评估 Polyline 分支
-
-使用相同数据划分对比：
-
-- LaneRobotV2 Row-Anchor。
-- Row-Anchor + 后处理多项式平滑。
-- Polyline head。
-
-比较指标不仅包括点误差，还应包括：
-
-- 曲线连续性。
-- 转角处稳定性。
-- 左右边界拓扑正确率。
-- 推理速度。
-- ONNX 导出复杂度。
-- 端侧量化精度损失。
-
-### P6：控制接口
-
-模型输出线坐标后，还需要独立的控制层：
+模型只负责输出语义线坐标。控制层建议独立实现：
 
 ```text
 线检测
-→ 选取目标线/通道中心
-→ 计算横向误差与航向误差
-→ 滤波与异常处理
+→ 选择目标线或计算通道中心
+→ 横向误差与航向误差
+→ 时序滤波与异常检测
 → 速度/转角控制器
 ```
 
-检测模型不应直接输出未经约束的电机控制命令。
+不应把单帧、未滤波、可能存在断点的预测坐标直接映射为电机命令。
 
 ---
 
-## 17. Git 建议
+## 19. 上游与许可证
 
-建议后续提交按功能拆分：
+本项目基于 Ultralytics 源码和原始 Lane Robot 项目继续修改。
 
-```text
-feat(lane): connect four-slot dataset to model head
-feat(lane): add multi-lane prediction results and decoding
-feat(lane): add synchronized geometric augmentation
-fix(lane): keep resize preprocessing consistent
-feat(lane): add per-slot validation metrics
-feat(polyline): add experimental polyline head
-chore(data): add dataset validation and split scripts
-docs: update lane robot project README
-```
-
-不要将完整数据集、训练输出和临时推理结果提交到仓库。
-
-推荐 `.gitignore` 至少包含：
-
-```gitignore
-datasets/
-runs/
-scripts/__pycache__/
-test/
-test_infer/
-*.pt
-*.onnx
-```
-
-是否忽略整个 `scripts/` 取决于其中是否包含需要版本管理的正式工具；通常正式脚本应提交，只忽略脚本输出目录。
-
----
-
-## 18. 结论
-
-当前已完成的主链路是：
-
-```text
-四槽位配置
-→ 多线标签读取
-→ P4+P5 LaneRobotV2
-→ cls + offset 输出
-→ 六项损失
-→ 反向传播
-→ Trainer
-→ Validator
-→ 权重保存
-→ Predictor
-→ 图片和 txt 输出
-```
-
-因此可以确认：
-
-> 固定四类、每类最多一条曲线的多线检测主链路已经完成并经过冒烟验证。
-
-当前尚不能确认的是正式精度、完整数据泛化能力、polyline 分支收益和端侧部署效果。下一阶段应优先完成全量数据检查与无增强基线训练，再进行模型结构扩展。
-
----
-
-## 19. 上游项目与许可证
-
-本项目基于 Ultralytics 源码修改。原始上游 README 已保存在：
+原始 Ultralytics README：
 
 ```text
 README.ultralytics.md
 ```
 
-许可证见：
+许可证：
 
 ```text
 LICENSE
 ```
+
+提交数据集、训练权重或第三方代码前，请分别确认数据授权、模型许可证和上游项目许可证要求。
