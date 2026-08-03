@@ -1847,6 +1847,11 @@ class LaneRobotV2(nn.Module):
     Uses a feature tensor (preferably P4+P5 fused), then:
         Conv1x1 -> AdaptiveAvgPool2d(feat_h, feat_w) -> Flatten -> FC -> ReLU -> cls/offset heads
 
+    For the four-lane model, the classification projection is split into two
+    independent Linear layers so each Gemm produces only two lane slots. This
+    keeps every classification Gemm below the RDK X5 65536-element limit while
+    preserving the original [B, X+1, R, 4] training/decode contract.
+
     Returns a dict during training/inference:
         {"cls": [B, x_grids+1, row_anchors, num_lanes],
          "offset": [B, 1, row_anchors, num_lanes]}
@@ -1854,6 +1859,7 @@ class LaneRobotV2(nn.Module):
     """
 
     export = False
+    export_split_outputs = False
 
     def __init__(
         self,
@@ -1883,8 +1889,123 @@ class LaneRobotV2(nn.Module):
         self.flatten_dim = self.reduce_channels * self.feat_h * self.feat_w
         self.cls_fc1 = nn.Linear(self.flatten_dim, self.hidden_dim)
         self.act = nn.ReLU(inplace=False)
-        self.cls_fc2 = nn.Linear(self.hidden_dim, (self.x_grids + 1) * self.row_anchors * self.num_lanes)
+        self.legacy_cls_migrated = False
+        if self.num_lanes == 4:
+            self.cls_lane_split = 2
+            split_out_dim = (self.x_grids + 1) * self.row_anchors * self.cls_lane_split
+            self.cls_fc2_01 = nn.Linear(self.hidden_dim, split_out_dim)
+            self.cls_fc2_23 = nn.Linear(self.hidden_dim, split_out_dim)
+        else:
+            # Keep non-four-lane experimental configs usable. The RDK X5
+            # new-head exporter intentionally accepts only the four-lane form.
+            self.cls_fc2 = nn.Linear(self.hidden_dim, (self.x_grids + 1) * self.row_anchors * self.num_lanes)
         self.offset_fc = nn.Linear(self.hidden_dim, self.row_anchors * self.num_lanes)
+
+    def _split_legacy_cls_tensors(self, weight, bias):
+        """Split legacy cls_fc2 tensors along the flattened lane axis without changing row order."""
+        classes = self.x_grids + 1
+        expected_rows = classes * self.row_anchors * self.num_lanes
+        if self.num_lanes != 4 or weight.shape != (expected_rows, self.hidden_dim):
+            raise RuntimeError(
+                "Legacy LaneRobotV2 cls_fc2 cannot be migrated: "
+                f"expected weight [{expected_rows}, {self.hidden_dim}] for four lanes, got {tuple(weight.shape)}."
+            )
+        weight_4d = weight.reshape(classes, self.row_anchors, self.num_lanes, self.hidden_dim)
+        weight_01 = weight_4d[:, :, :2, :].reshape(-1, self.hidden_dim).contiguous()
+        weight_23 = weight_4d[:, :, 2:, :].reshape(-1, self.hidden_dim).contiguous()
+        if bias is None:
+            return weight_01, None, weight_23, None
+        if bias.shape != (expected_rows,):
+            raise RuntimeError(f"Legacy LaneRobotV2 cls_fc2 bias has unexpected shape {tuple(bias.shape)}.")
+        bias_3d = bias.reshape(classes, self.row_anchors, self.num_lanes)
+        bias_01 = bias_3d[:, :, :2].reshape(-1).contiguous()
+        bias_23 = bias_3d[:, :, 2:].reshape(-1).contiguous()
+        return weight_01, bias_01, weight_23, bias_23
+
+    def migrate_legacy_classification_head(self) -> bool:
+        """Replace an unpickled legacy four-lane cls_fc2 with two exactly equivalent Linear heads."""
+        legacy = getattr(self, "cls_fc2", None)
+        if legacy is None:
+            return False
+        if self.num_lanes != 4:
+            raise RuntimeError("The split classification head requires num_lanes=4.")
+
+        weight_01, bias_01, weight_23, bias_23 = self._split_legacy_cls_tensors(legacy.weight, legacy.bias)
+        out_features = (self.x_grids + 1) * self.row_anchors * 2
+        fc_01 = nn.Linear(self.hidden_dim, out_features, bias=legacy.bias is not None).to(
+            device=legacy.weight.device, dtype=legacy.weight.dtype
+        )
+        fc_23 = nn.Linear(self.hidden_dim, out_features, bias=legacy.bias is not None).to(
+            device=legacy.weight.device, dtype=legacy.weight.dtype
+        )
+        with torch.no_grad():
+            fc_01.weight.copy_(weight_01)
+            fc_23.weight.copy_(weight_23)
+            if legacy.bias is not None:
+                fc_01.bias.copy_(bias_01)
+                fc_23.bias.copy_(bias_23)
+
+            # Prove that the lane-interleaved flatten order was reconstructed
+            # exactly before discarding the old large projection.
+            rebuilt_weight = torch.cat(
+                (
+                    fc_01.weight.reshape(self.x_grids + 1, self.row_anchors, 2, self.hidden_dim),
+                    fc_23.weight.reshape(self.x_grids + 1, self.row_anchors, 2, self.hidden_dim),
+                ),
+                dim=2,
+            ).reshape_as(legacy.weight)
+            if not torch.equal(rebuilt_weight, legacy.weight):
+                raise RuntimeError("Legacy cls_fc2 weight migration was not bit-exact.")
+            if legacy.bias is not None:
+                rebuilt_bias = torch.cat(
+                    (
+                        fc_01.bias.reshape(self.x_grids + 1, self.row_anchors, 2),
+                        fc_23.bias.reshape(self.x_grids + 1, self.row_anchors, 2),
+                    ),
+                    dim=2,
+                ).reshape_as(legacy.bias)
+                if not torch.equal(rebuilt_bias, legacy.bias):
+                    raise RuntimeError("Legacy cls_fc2 bias migration was not bit-exact.")
+
+        fc_01.train(legacy.training).requires_grad_(legacy.weight.requires_grad)
+        fc_23.train(legacy.training).requires_grad_(legacy.weight.requires_grad)
+        self.cls_lane_split = 2
+        self.cls_fc2_01 = fc_01
+        self.cls_fc2_23 = fc_23
+        del self.cls_fc2
+        self.legacy_cls_migrated = True
+        return True
+
+    def __setstate__(self, state):
+        """Migrate full-module checkpoints saved before the split-head change."""
+        super().__setstate__(state)
+        if not hasattr(self, "export_split_outputs"):
+            self.export_split_outputs = False
+        if not hasattr(self, "legacy_cls_migrated"):
+            self.legacy_cls_migrated = False
+        if getattr(self, "num_lanes", None) == 4 and hasattr(self, "cls_fc2"):
+            self.migrate_legacy_classification_head()
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        """Accept legacy state_dict checkpoints containing one cls_fc2 projection."""
+        legacy_weight_key = prefix + "cls_fc2.weight"
+        legacy_bias_key = prefix + "cls_fc2.bias"
+        split_weight_key = prefix + "cls_fc2_01.weight"
+        if self.num_lanes == 4 and legacy_weight_key in state_dict and split_weight_key not in state_dict:
+            weight = state_dict.pop(legacy_weight_key)
+            bias = state_dict.pop(legacy_bias_key, None)
+            weight_01, bias_01, weight_23, bias_23 = self._split_legacy_cls_tensors(weight, bias)
+            state_dict[prefix + "cls_fc2_01.weight"] = weight_01
+            state_dict[prefix + "cls_fc2_23.weight"] = weight_23
+            if bias is not None:
+                state_dict[prefix + "cls_fc2_01.bias"] = bias_01
+                state_dict[prefix + "cls_fc2_23.bias"] = bias_23
+            self.legacy_cls_migrated = True
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     def forward(self, x):
         x = self.conv_1x1(x)
@@ -1892,9 +2013,20 @@ class LaneRobotV2(nn.Module):
         x = torch.flatten(x, 1)
         feat = self.act(self.cls_fc1(x))
         b = feat.shape[0]
-        cls = self.cls_fc2(feat).view(b, self.x_grids + 1, self.row_anchors, self.num_lanes)
+        if self.num_lanes == 4:
+            if not hasattr(self, "cls_fc2_01") or not hasattr(self, "cls_fc2_23"):
+                self.migrate_legacy_classification_head()
+            cls_01 = self.cls_fc2_01(feat).view(b, self.x_grids + 1, self.row_anchors, 2)
+            cls_23 = self.cls_fc2_23(feat).view(b, self.x_grids + 1, self.row_anchors, 2)
+            cls = torch.cat((cls_01, cls_23), dim=3)
+        else:
+            cls = self.cls_fc2(feat).view(b, self.x_grids + 1, self.row_anchors, self.num_lanes)
         # Bound offsets to [-0.5, 0.5] grid cells for stable sub-grid localization.
         offset = torch.tanh(self.offset_fc(feat)).view(b, 1, self.row_anchors, self.num_lanes) * 0.5
+        if self.export and self.export_split_outputs:
+            if self.num_lanes != 4:
+                raise RuntimeError("Split ONNX outputs require a four-lane LaneRobotV2 head.")
+            return cls_01, cls_23, offset
         if self.export:
             return torch.cat((cls, offset), dim=1)
         return {"cls": cls, "offset": offset}

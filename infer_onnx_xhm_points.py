@@ -78,7 +78,7 @@ LANE_COLORS = {
 
 def parse_args(default_model: Path = DEFAULT_MODEL) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="批量使用 ONNX 推理 Lane Robot 图片并绘制四线结果。"
+        description="批量使用 ONNX 推理 Lane Robot 图片并仅绘制预测锚点。"
     )
     parser.add_argument(
         "--model",
@@ -153,7 +153,7 @@ def parse_args(default_model: Path = DEFAULT_MODEL) -> argparse.Namespace:
         "--line-width",
         type=int,
         default=0,
-        help="绘制线宽；0 表示根据图片尺寸自动选择。",
+        help="兼容旧参数：现在用于控制预测点半径；0 表示根据图片尺寸自动选择。",
     )
     parser.add_argument(
         "--save-txt",
@@ -602,6 +602,8 @@ def draw_lanes(
     """
     lanes:
         [R, L]，行顺序与训练标签一致：y_end -> y_start。
+
+    只绘制有效锚点；x=-1 的位置不画点，也不会在相邻有效点之间连线。
     """
     bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
     output = np.ascontiguousarray(bgr_image.copy())
@@ -609,12 +611,14 @@ def draw_lanes(
     height, width = output.shape[:2]
     row_anchors, num_lanes = lanes.shape
 
-    thickness = (
+    # 仅绘制锚点，不绘制任何折线。为兼容既有命令，继续接受
+    # --line-width 参数，但现在将它作为点半径使用。
+    radius = (
         int(line_width)
         if int(line_width) > 0
-        else max(round((height + width) / 700), 2)
+        else max(round((height + width) / 700), 3)
     )
-    radius = max(thickness + 1, 3)
+    text_thickness = max(radius // 2, 1)
 
     if row_y is None:
         row_y = np.linspace(float(y_end), float(y_start), row_anchors, dtype=np.float32)
@@ -663,16 +667,6 @@ def draw_lanes(
 
         active_lane_ids.append(lane_id)
 
-        if len(points) >= 2:
-            cv2.polylines(
-                output,
-                [np.asarray(points, dtype=np.int32)],
-                isClosed=False,
-                color=color,
-                thickness=thickness,
-                lineType=cv2.LINE_AA,
-            )
-
         lane_name = LANE_NAMES.get(
             lane_id,
             f"lane_{lane_id}",
@@ -689,7 +683,7 @@ def draw_lanes(
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             color,
-            max(thickness - 1, 1),
+            text_thickness,
             cv2.LINE_AA,
         )
 

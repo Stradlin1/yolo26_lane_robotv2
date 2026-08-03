@@ -198,10 +198,12 @@ def find_and_enable_lane_export(model: nn.Module) -> nn.Module:
             "x_grids",
             "row_anchors",
             "num_lanes",
-            "cls_fc2",
             "offset_fc",
         )
-        if all(hasattr(module, name) for name in required):
+        has_classification_head = hasattr(module, "cls_fc2") or (
+            hasattr(module, "cls_fc2_01") and hasattr(module, "cls_fc2_23")
+        )
+        if all(hasattr(module, name) for name in required) and has_classification_head:
             candidates.append(module)
 
     if len(candidates) != 1:
