@@ -786,6 +786,26 @@ yolo task=lane mode=predict \
 
 项目已经开展 PT → ONNX 导出和 ONNX Runtime 推理适配工作。
 
+当前 `x_grids=320` 模型的 ONNX 合并输出为 `[B, 322, 56, 4]`：前
+321 个通道是分类 logits（索引 320 为 no-lane），最后 1 个通道是
+offset。导出与推理脚本默认都会校验 `x_grids=320`，防止把旧的 160-grid
+模型误当成当前模型使用。
+
+```bash
+conda run -n lane_robot python export_onnx_xhm.py \
+  --weights runs/lane/lane_n_baseline-4/weights/best.pt \
+  --output runs/lane/lane_n_baseline-4/weights/best.onnx \
+  --verify-runtime
+
+conda run -n lane_robot python infer_onnx_xhm.py \
+  --model runs/lane/lane_n_baseline-4/weights/best.onnx \
+  --source test \
+  --output test_infer
+```
+
+如需有意导出或推理旧的 `x_grids=160` 模型，两个脚本都必须显式添加
+`--allow-legacy-x-grids`。
+
 关键要求：
 
 - ONNX 输入预处理必须与训练保持一致：直接 Resize 模型不加参数，LetterBox 模型使用 `infer_onnx_xhm.py --letterbox`。

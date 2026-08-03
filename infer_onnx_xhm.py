@@ -28,7 +28,8 @@
        - cls    [B, 321, 56, 4]
        - offset [B,   1, 56, 4]
 
-通道数会从 ONNX 输出动态解析，因此仍可读取旧的 X=160 模型。
+默认要求 X=320，避免误用旧的 X=160 模型。仅在明确需要推理旧模型时使用
+--allow-legacy-x-grids。
 """
 
 from __future__ import annotations
@@ -47,12 +48,13 @@ from ultralytics.models.yolo.lane.geometry import letterbox_lane_image, restore_
 PROJECT_ROOT = Path("/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT")
 DEFAULT_MODEL = (
     PROJECT_ROOT
-    / "runs/lane/lane_n_baseline/weights/best.onnx"
+    / "runs/lane/lane_n_baseline-2/weights/best.onnx"
 )
 DEFAULT_SOURCE = PROJECT_ROOT / "test"
 DEFAULT_OUTPUT = PROJECT_ROOT / "test_infer"
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+CURRENT_X_GRIDS = 320
 
 LANE_NAMES = {
     0: "lane_follow",
@@ -102,6 +104,17 @@ def parse_args() -> argparse.Namespace:
         "--letterbox",
         action="store_true",
         help="保持宽高比，纵向黑边全部补在顶部，横向黑边在左右居中；必须与训练设置一致。",
+    )
+    parser.add_argument(
+        "--expected-x-grids",
+        type=int,
+        default=CURRENT_X_GRIDS,
+        help=f"模型应使用的有效横向网格数，默认 {CURRENT_X_GRIDS}。",
+    )
+    parser.add_argument(
+        "--allow-legacy-x-grids",
+        action="store_true",
+        help="允许推理 x_grids 不是 320 的旧 ONNX 模型。",
     )
     parser.add_argument(
         "--exist-thr",
@@ -261,6 +274,7 @@ def preprocess(
 
 def split_outputs(
     outputs: list[np.ndarray],
+    expected_x_grids: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
     """
     返回：
@@ -282,6 +296,16 @@ def split_outputs(
 
         if output.shape[1] >= 3:
             # 合并输出约定为 (X+1) 个分类通道 + 1 个 offset 通道。
+            actual_x_grids = int(output.shape[1] - 2)
+            if (
+                expected_x_grids is not None
+                and actual_x_grids != expected_x_grids
+            ):
+                raise RuntimeError(
+                    "ONNX 合并输出与当前 x_grids 配置不一致："
+                    f"输出形状 {output.shape} 表示 x_grids={actual_x_grids}，"
+                    f"但期望 x_grids={expected_x_grids}。"
+                )
             cls_logits = output[:, :-1, :, :]
             offset = output[:, -1:, :, :]
             return cls_logits, offset
@@ -309,7 +333,53 @@ def split_outputs(
             f"无法在 ONNX 输出中找到分类 logits，输出形状：{shapes}"
         )
 
+    actual_x_grids = int(cls_logits.shape[1] - 1)
+    if expected_x_grids is not None and actual_x_grids != expected_x_grids:
+        raise RuntimeError(
+            "ONNX 分类输出与当前 x_grids 配置不一致："
+            f"输出形状 {cls_logits.shape} 表示 x_grids={actual_x_grids}，"
+            f"但期望 x_grids={expected_x_grids}。"
+        )
+
     return cls_logits, offset
+
+
+def inspect_output_layout(
+    output_infos,
+    expected_x_grids: int | None,
+) -> tuple[int, str]:
+    """Validate static ONNX output metadata before processing any images."""
+    shapes = [tuple(info.shape) for info in output_infos]
+
+    for shape in shapes:
+        if len(shape) != 4:
+            continue
+        channels = shape[1]
+        if isinstance(channels, int) and channels == 1:
+            continue
+        if isinstance(channels, int) and channels >= 3:
+            # A single output is cls+offset; multiple outputs expose cls alone.
+            x_grids = channels - (2 if len(shapes) == 1 else 1)
+            if expected_x_grids is not None and x_grids != expected_x_grids:
+                raise RuntimeError(
+                    "ONNX 模型不是当前要求的 x_grids 版本。\n"
+                    f"模型输出：{shapes}\n"
+                    f"解析得到：x_grids={x_grids}\n"
+                    f"当前要求：x_grids={expected_x_grids}\n"
+                    "请使用 320-grid ONNX 模型；若明确要运行旧模型，添加 "
+                    "--allow-legacy-x-grids。"
+                )
+            layout = (
+                "merged cls+offset"
+                if len(shapes) == 1
+                else "separate cls/offset"
+            )
+            return int(x_grids), layout
+
+    raise RuntimeError(
+        "无法从 ONNX 输出元数据识别 Lane Robot 输出布局："
+        f"{shapes}"
+    )
 
 
 def softmax(values: np.ndarray, axis: int) -> np.ndarray:
@@ -634,6 +704,9 @@ def main() -> None:
     if args.topk < 1:
         raise ValueError("--topk 必须至少为 1。")
 
+    if args.expected_x_grids < 1:
+        raise ValueError("--expected-x-grids 必须至少为 1。")
+
     if not 0.0 <= args.poly_blend <= 1.0:
         raise ValueError("--poly-blend 必须位于 [0, 1]。")
 
@@ -657,10 +730,17 @@ def main() -> None:
     input_info = session.get_inputs()[0]
     input_name = input_info.name
     input_hw = get_input_hw(session)
-    output_names = [
-        output.name
-        for output in session.get_outputs()
-    ]
+    output_infos = session.get_outputs()
+    output_names = [output.name for output in output_infos]
+    required_x_grids = (
+        None
+        if args.allow_legacy_x_grids
+        else args.expected_x_grids
+    )
+    model_x_grids, output_layout = inspect_output_layout(
+        output_infos,
+        required_x_grids,
+    )
 
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -673,6 +753,8 @@ def main() -> None:
     print(f"input name  : {input_name}")
     print(f"input size  : {input_hw[0]} x {input_hw[1]}")
     print(f"outputs     : {output_names}")
+    print(f"layout      : {output_layout}")
+    print(f"x_grids     : {model_x_grids}")
     print(f"providers   : {session.get_providers()}")
     print(f"exist_thr   : {args.exist_thr}")
     print(f"topk        : {args.topk}")
@@ -712,7 +794,10 @@ def main() -> None:
                 {input_name: input_tensor},
             )
 
-            cls_logits, offset = split_outputs(outputs)
+            cls_logits, offset = split_outputs(
+                outputs,
+                expected_x_grids=required_x_grids,
+            )
 
             lanes_batch, x_grids = decode_lanes(
                 cls_logits=cls_logits,

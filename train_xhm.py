@@ -29,23 +29,24 @@ DEFAULT_DATA = PROJECT_ROOT / "ultralytics/cfg/datasets/lane-robot.yaml"
 DEFAULT_RUNS = PROJECT_ROOT / "runs/lane"
 
 
-# 当前 LaneRobotDataset 只执行读取图片、EXIF 修正和 resize，尚未调用这些增强参数。
-# 因此本字典先保持为无增强基线。以后将增强逻辑接入 dataset.py 后，这些值才会生效。
+# LaneRobotDataset 已支持 HSV/BGR 颜色增强，以及旋转、平移、缩放、剪切、
+# 透视和翻转等几何增强；几何增强会同步变换车道标签并重采样到 row anchors。
+# 当前数值保持为无增强基线，需要实验增强时直接改本字典。
 AUGMENTATION_CONFIG = {
     # 颜色增强：黄色通道/绿色背景具有语义，建议保守。
-    "hsv_h": 0.0,
-    "hsv_s": 0.0,
-    "hsv_v": 0.0,
+    "hsv_h": 0.005,
+    "hsv_s": 0.15,
+    "hsv_v": 0.15,
     "bgr": 0.0,
 
-    # 几何增强：当前没有同步变换车道标签的实现，必须关闭。
-    "degrees": 0.0,
+    # 几何增强：已支持同步变换车道标签，车道任务建议从小幅度开始。
+    "degrees": 2.0,
     "translate": 0.0,
     "scale": 0.0,
     "shear": 0.0,
     "perspective": 0.0,
     "flipud": 0.0,
-    "fliplr": 0.0,
+    "fliplr": 0.3,
 
     # 拼接/混合增强会破坏连续通道结构，保持关闭。
     "mosaic": 0.0,
@@ -84,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-epochs", type=float, default=3.0)
 
-    parser.add_argument("--save-period", type=int, default=10, help="Save checkpoint every N epochs; -1 disables.")
+    parser.add_argument("--save-period", type=int, default=100, help="Save checkpoint every N epochs; -1 disables.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None, help="Path to last.pt for interrupted-run resume.")
     parser.add_argument("--exist-ok", action="store_true", help="Allow reusing an existing experiment directory.")

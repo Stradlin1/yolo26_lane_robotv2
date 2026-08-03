@@ -17,9 +17,12 @@ Output channel layout for x_grids=320:
 
     lane_output[:, 321:322, :, :] -> sub-grid offset in [-0.5, 0.5]
 
-The checkpoint head is the source of truth for x_grids. Legacy x_grids=160
-checkpoints still export 162 channels. The default export is static batch=1;
-use --dynamic-batch only when the deployment runtime needs a variable batch.
+The checkpoint head is the source of truth for the actual output shape. By
+default this script requires x_grids=320, so an old x_grids=160 checkpoint
+cannot be exported as the current model by mistake. Pass --allow-legacy-x-grids
+only when an old model intentionally needs to be exported. The default export
+is static batch=1; use --dynamic-batch only when the deployment runtime needs a
+variable batch.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ DEFAULT_WEIGHTS = Path(
     "runs/lane/lane_n_baseline-2/weights/best.pt"
 )
 DEFAULT_IMGSZ = (320, 320)
+CURRENT_X_GRIDS = 320
 OPSET = 11
 
 
@@ -76,6 +80,49 @@ class LaneOnnxWrapper(nn.Module):
         )
 
 
+class OnnxAdaptiveAvgPool2d(nn.Module):
+    """Exact adaptive average pooling expressed with ONNX opset-11 primitives."""
+
+    def __init__(self, output_size: tuple[int, int]) -> None:
+        super().__init__()
+        self.output_size = tuple(map(int, output_size))
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        # Spatial dimensions are static in this exporter; only batch can be
+        # dynamic. AdaptiveAvgPool2d uses these same floor/ceil boundaries.
+        input_h = int(features.shape[-2])
+        input_w = int(features.shape[-1])
+        output_h, output_w = self.output_size
+
+        rows = []
+        for row in range(output_h):
+            h_start = (row * input_h) // output_h
+            h_end = ((row + 1) * input_h + output_h - 1) // output_h
+            columns = []
+            for column in range(output_w):
+                w_start = (column * input_w) // output_w
+                w_end = ((column + 1) * input_w + output_w - 1) // output_w
+                region = features[:, :, h_start:h_end, w_start:w_end]
+                columns.append(region.mean(dim=(-2, -1), keepdim=True))
+            rows.append(torch.cat(columns, dim=3))
+        return torch.cat(rows, dim=2)
+
+
+def replace_unsupported_adaptive_pool(head: nn.Module) -> None:
+    """Replace the Lane head pool without changing its numerical result."""
+    pool = getattr(head, "pool", None)
+    if not isinstance(pool, nn.AdaptiveAvgPool2d):
+        raise RuntimeError(
+            "Lane head must expose nn.AdaptiveAvgPool2d as 'pool' for ONNX export, "
+            f"got {type(pool).__name__}."
+        )
+
+    output_size = pool.output_size
+    if isinstance(output_size, int):
+        output_size = (output_size, output_size)
+    head.pool = OnnxAdaptiveAvgPool2d(tuple(output_size))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export Lane Robot best.pt to ONNX opset 11."
@@ -110,6 +157,23 @@ def parse_args() -> argparse.Namespace:
         "--dynamic-batch",
         action="store_true",
         help="Make only the batch dimension dynamic.",
+    )
+    parser.add_argument(
+        "--expected-x-grids",
+        type=int,
+        default=CURRENT_X_GRIDS,
+        help=(
+            "Required x_grids value in the checkpoint head. "
+            f"Default: {CURRENT_X_GRIDS}."
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-x-grids",
+        action="store_true",
+        help=(
+            "Allow exporting a checkpoint whose x_grids differs from "
+            "--expected-x-grids. Use this only for an intentional legacy export."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -184,6 +248,9 @@ def main() -> None:
     if args.batch < 1:
         raise ValueError("--batch must be at least 1")
 
+    if args.expected_x_grids < 1:
+        raise ValueError("--expected-x-grids must be at least 1")
+
     height, width = map(int, args.imgsz)
     if height <= 0 or width <= 0:
         raise ValueError("--imgsz values must be positive")
@@ -228,6 +295,16 @@ def main() -> None:
     num_lanes = int(head.num_lanes)
     expected_channels = x_grids + 2
 
+    if x_grids != args.expected_x_grids and not args.allow_legacy_x_grids:
+        raise RuntimeError(
+            "Checkpoint x_grids does not match the current export target.\n"
+            f"Checkpoint head: x_grids={x_grids}, output channels={x_grids + 2}\n"
+            f"Expected:        x_grids={args.expected_x_grids}, "
+            f"output channels={args.expected_x_grids + 2}\n"
+            "Use a checkpoint trained with x_grids=320. If this is an intentional "
+            "legacy export, add --allow-legacy-x-grids."
+        )
+
     wrapper = LaneOnnxWrapper(torch_model).to(args.device).float().eval()
     dummy = torch.zeros(
         args.batch,
@@ -240,6 +317,23 @@ def main() -> None:
 
     with torch.inference_mode():
         torch_output = wrapper(dummy)
+
+    # The legacy opset-11 exporter cannot lower AdaptiveAvgPool2d when 20x20
+    # is pooled to 8x10 because one spatial ratio is non-integral. Replace it
+    # with an exact decomposition and verify that predictions stay unchanged.
+    replace_unsupported_adaptive_pool(head)
+    with torch.inference_mode():
+        export_output = wrapper(dummy)
+
+    max_pool_error = float(
+        torch.max(torch.abs(torch_output - export_output)).item()
+    )
+    if not torch.allclose(torch_output, export_output, rtol=1e-5, atol=1e-5):
+        raise RuntimeError(
+            "ONNX-compatible adaptive pooling changed model output: "
+            f"max_abs_error={max_pool_error:.8g}"
+        )
+    torch_output = export_output
 
     expected_shape = (
         args.batch,
@@ -261,6 +355,7 @@ def main() -> None:
     print(f"row_anchors  : {row_anchors}")
     print(f"num_lanes    : {num_lanes}")
     print(f"output shape : {actual_shape}")
+    print(f"pool rewrite : PASS (max abs error {max_pool_error:.8g})")
 
     dynamic_axes = None
     if args.dynamic_batch:

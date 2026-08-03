@@ -7,6 +7,5 @@
 __pycache__/
 *.py[cod]
 sem/*.pt
-/test_infer0/
 # Inference outputs
 test_infer0/
