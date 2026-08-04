@@ -30,10 +30,10 @@ MODEL_PATH = (
 
 # Absolute path of the external dataset to infer.
 # Change this path to the actual image directory or to one image file.
-SOURCE_PATH = Path("/home/xhm/Desktop/external_lane_dataset/images")
+SOURCE_PATH = Path("/home/xhm/Desktop/channelout/jpg")
 
 # Absolute output directory. The source subdirectory structure is preserved.
-OUTPUT_PATH = PROJECT_ROOT / "external_dataset_newhead_infer"
+OUTPUT_PATH = Path("/home/xhm/Desktop/channelout/output")
 
 
 def has_cli_option(option: str) -> bool:
