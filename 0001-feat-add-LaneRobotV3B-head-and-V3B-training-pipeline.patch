@@ -1,0 +1,749 @@
+From 5e447a6f9380329755e743c0fee57de26312a140 Mon Sep 17 00:00:00 2001
+From: Burnling <behld@qq.com>
+Date: Tue, 4 Aug 2026 02:39:03 +0800
+Subject: [PATCH] feat: add LaneRobotV3B head and V3B training pipeline
+
+Model: LaneRobotV3B head (per-lane classifiers shared across 56 rows, fixed bilinear row sampling, row mean + row embedding), output protocol unchanged [B,321,56,4]+[B,1,56,4]; backbone/neck identical to V2; new yolo26s-lane-v3b.yaml.
+
+Input size changed: unified to 256x448 (previously 256x320 train / 320x320 deploy). H/W both divisible by 32, fused feat 16x28, aspect 1.75 close to native 16:9; training/export/deploy now use the same size.
+
+Training: train_v3b.py is the V3B entry. Start: python train_v3b.py --weights <V2.pt> --name lane_v3b. --weights transfers backbone/neck (L0-L15), head starts random. Defaults: batch=-1, lr0=3e-4, epochs=500, patience=100, imgsz 256x448.
+
+Loss/metrics/data: soft-label center and offset target both use round(target_x); validator reports per-lane MAE/Acc@1/3/5/Exist; dataset root overridable via LANE_ROBOT_DATASETS; default.yaml lane params aligned to V3B.
+
+Before training, run a lightweight dataset EDA: per-slot presence rate and x distribution, lead_lane symmetry (fliplr safety), far-row density, label-image overlays, train/val overlap; use per-slot stats to decide no-lane bias init if needed.
+---
+ train_v3b.py                                  | 197 ++++++++++++++++++
+ ultralytics/cfg/datasets/lane-robot.yaml      |   1 +
+ ultralytics/cfg/default.yaml                  |   6 +-
+ .../cfg/models/26/yolo26s-lane-v3b.yaml       |  55 +++++
+ ultralytics/models/yolo/lane/dataset.py       |   4 +-
+ ultralytics/models/yolo/lane/train.py         |   4 +-
+ ultralytics/models/yolo/lane/val.py           | 100 ++++++++-
+ ultralytics/nn/modules/__init__.py            |   2 +
+ ultralytics/nn/modules/head.py                | 109 ++++++++++
+ ultralytics/nn/tasks.py                       |   5 +-
+ ultralytics/utils/loss.py                     |   6 +-
+ 11 files changed, 473 insertions(+), 16 deletions(-)
+ create mode 100644 train_v3b.py
+ create mode 100644 ultralytics/cfg/models/26/yolo26s-lane-v3b.yaml
+
+diff --git a/train_v3b.py b/train_v3b.py
+new file mode 100644
+index 0000000..9623eb4
+--- /dev/null
++++ b/train_v3b.py
+@@ -0,0 +1,197 @@
++#!/usr/bin/env python3
++"""LaneRobotV3B 四槽位多线模型正式训练脚本。
++
++与 train_xhm.py（V2 时代脚本）的区别：
++    - 默认模型为 yolo26s-lane-v3b.yaml（V3-B 头，256x448 输入）
++    - 支持 --weights 传入 V2 checkpoint，自动只迁移 backbone/neck（L0~L15）
++    - 增强配置按 V3-B 定稿值收敛：小 translate/scale、保守 hsv、fliplr 0.5
++    - 路径基于脚本所在目录，不再硬编码 /home/xhm/Desktop/...
++
++默认用法：
++    python train_v3b.py --weights runs/lane/lane_n_baseline/weights/last.pt
++
++常用覆盖：
++    python train_v3b.py --weights <v2.pt> --epochs 300 --patience 60 --batch 16
++"""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++from ultralytics import YOLO
++
++
++PROJECT_ROOT = Path(__file__).resolve().parent
++DEFAULT_MODEL = PROJECT_ROOT / "ultralytics/cfg/models/26/yolo26s-lane-v3b.yaml"
++DEFAULT_DATA = PROJECT_ROOT / "ultralytics/cfg/datasets/lane-robot.yaml"
++DEFAULT_RUNS = PROJECT_ROOT / "runs/lane"
++
++
++# V3-B 定稿增强配置：几何只做轻微位姿扰动，颜色保持保守，连续结构增强全部关闭。
++AUGMENTATION_CONFIG = {
++    # 颜色增强：色相几乎不动，饱和度/亮度轻微扰动。
++    "hsv_h": 0.002,
++    "hsv_s": 0.05,
++    "hsv_v": 0.05,
++    "bgr": 0.0,
++
++    # 几何增强：小幅平移/缩放，模拟位姿抖动；大变形关闭。
++    "degrees": 2.0,
++    "translate": 0.03,
++    "scale": 0.05,
++    "shear": 0.0,
++    "perspective": 0.0,
++    "flipud": 0.0,
++    "fliplr": 0.5,
++
++    # 拼接/混合增强会破坏连续车道结构，保持关闭。
++    "mosaic": 0.0,
++    "mixup": 0.0,
++    "cutmix": 0.0,
++    "copy_paste": 0.0,
++    "erasing": 0.0,
++    "close_mosaic": 0,
++}
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="Train the four-slot LaneRobot V3-B model.")
++
++    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="Lane model YAML path.")
++    parser.add_argument("--data", type=Path, default=DEFAULT_DATA, help="Dataset YAML path.")
++    parser.add_argument("--project", type=Path, default=DEFAULT_RUNS, help="Training output root.")
++    parser.add_argument("--name", default="lane_v3b", help="Experiment directory name.")
++    parser.add_argument(
++        "--weights",
++        type=Path,
++        default=None,
++        help="V2 checkpoint path; backbone/neck (L0~L15) will be transferred, head starts random.",
++    )
++
++    parser.add_argument("--epochs", type=int, default=500, help="Maximum training epochs.")
++    parser.add_argument(
++        "--patience",
++        type=int,
++        default=100,
++        help="Stop after this many epochs without fitness improvement; 0 disables early stopping.",
++    )
++    parser.add_argument("--batch", type=int, default=-1, help="Batch size; -1 auto-selects the largest safe batch.")
++    parser.add_argument("--workers", type=int, default=8, help="DataLoader worker processes.")
++    parser.add_argument("--device", default="0", help="CUDA device, e.g. 0, 0,1, or cpu.")
++    parser.add_argument("--img-height", type=int, default=256, help="Input image height.")
++    parser.add_argument("--img-width", type=int, default=448, help="Input image width.")
++
++    parser.add_argument("--optimizer", default="AdamW", choices=("AdamW", "Adam", "SGD", "auto"))
++    parser.add_argument("--lr0", type=float, default=3e-4, help="Initial learning rate.")
++    parser.add_argument("--lrf", type=float, default=0.01, help="Final LR fraction: final_lr = lr0*lrf.")
++    parser.add_argument("--weight-decay", type=float, default=0.01)
++    parser.add_argument("--warmup-epochs", type=float, default=3.0)
++
++    parser.add_argument("--save-period", type=int, default=100, help="Save checkpoint every N epochs; -1 disables.")
++    parser.add_argument("--seed", type=int, default=42)
++    parser.add_argument("--resume", type=Path, default=None, help="Path to last.pt for interrupted-run resume.")
++    parser.add_argument("--exist-ok", action="store_true", help="Allow reusing an existing experiment directory.")
++    parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision.")
++    parser.add_argument("--nondeterministic", action="store_true", help="Disable deterministic training mode.")
++
++    args = parser.parse_args()
++
++    if args.epochs <= 0:
++        parser.error("--epochs must be greater than 0")
++    if args.patience < 0:
++        parser.error("--patience must be 0 or greater")
++    if args.batch == 0:
++        parser.error("--batch must be -1 (auto) or a positive integer")
++    if args.img_height <= 0 or args.img_width <= 0:
++        parser.error("image dimensions must be greater than 0")
++
++    return args
++
++
++def require_file(path: Path, description: str) -> Path:
++    path = path.expanduser().resolve()
++    if not path.is_file():
++        raise FileNotFoundError(f"{description} does not exist: {path}")
++    return path
++
++
++def main() -> None:
++    args = parse_args()
++
++    data_path = require_file(args.data, "Dataset YAML")
++    project_path = args.project.expanduser().resolve()
++    project_path.mkdir(parents=True, exist_ok=True)
++
++    if args.weights is not None:
++        weights_path = require_file(args.weights, "V2 checkpoint")
++        pretrained = str(weights_path)
++    else:
++        pretrained = False
++
++    if args.resume is not None:
++        resume_path = require_file(args.resume, "Resume checkpoint")
++        model = YOLO(str(resume_path), task="lane")
++        resume_value: bool | str = str(resume_path)
++        model_source = resume_path
++    else:
++        model_path = require_file(args.model, "Model YAML")
++        model = YOLO(str(model_path), task="lane")
++        resume_value = False
++        model_source = model_path
++
++    train_config = {
++        "data": str(data_path),
++        "epochs": args.epochs,
++        "patience": args.patience,
++        "batch": args.batch,
++        "imgsz": [args.img_height, args.img_width],
++        "device": args.device,
++        "workers": args.workers,
++        "optimizer": args.optimizer,
++        "lr0": args.lr0,
++        "lrf": args.lrf,
++        "weight_decay": args.weight_decay,
++        "warmup_epochs": args.warmup_epochs,
++        "cos_lr": True,
++        "amp": not args.no_amp,
++        "seed": args.seed,
++        "deterministic": not args.nondeterministic,
++        "pretrained": pretrained,
++        "val": True,
++        "plots": True,
++        "save": True,
++        "save_period": args.save_period,
++        "project": str(project_path),
++        "name": args.name,
++        "exist_ok": args.exist_ok,
++        "resume": resume_value,
++        **AUGMENTATION_CONFIG,
++    }
++
++    print("=" * 72)
++    print("LaneRobot V3-B training")
++    print(f"model/resume : {model_source}")
++    print(f"data         : {data_path}")
++    print(f"v2 weights   : {weights_path if args.weights is not None else 'None (random init)'}")
++    print(f"output       : {project_path / args.name}")
++    print(f"epochs       : {args.epochs}")
++    print(f"patience     : {args.patience} (0 means disabled)")
++    print(f"batch        : {args.batch} (-1 = autobatch)")
++    print(f"imgsz        : [{args.img_height}, {args.img_width}]")
++    print(f"device       : {args.device}")
++    print(
++        "augmentation : "
++        f"fliplr={AUGMENTATION_CONFIG['fliplr']}, "
++        f"translate={AUGMENTATION_CONFIG['translate']}, "
++        f"scale={AUGMENTATION_CONFIG['scale']}, "
++        f"degrees={AUGMENTATION_CONFIG['degrees']}, "
++        f"hsv=({AUGMENTATION_CONFIG['hsv_h']}, {AUGMENTATION_CONFIG['hsv_s']}, {AUGMENTATION_CONFIG['hsv_v']})"
++    )
++    print("=" * 72)
++
++    model.train(**train_config)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/ultralytics/cfg/datasets/lane-robot.yaml b/ultralytics/cfg/datasets/lane-robot.yaml
+index bd7ba6f..f799eea 100644
+--- a/ultralytics/cfg/datasets/lane-robot.yaml
++++ b/ultralytics/cfg/datasets/lane-robot.yaml
+@@ -3,6 +3,7 @@
+ #   lane_id x1 y1 x2 y2 ... x56 y56
+ # x is normalized [0,1]; x=-1 means absent/no-lane. y is normalized [0,1].
+ # Default label path follows images/... -> labels/... with the same basename and .txt suffix.
++# path 可用环境变量 LANE_ROBOT_DATASETS 覆盖，避免不同机器间改 YAML。
+ 
+ path: /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/datasets
+ train: images/train
+diff --git a/ultralytics/cfg/default.yaml b/ultralytics/cfg/default.yaml
+index 98e1db6..0aaea15 100644
+--- a/ultralytics/cfg/default.yaml
++++ b/ultralytics/cfg/default.yaml
+@@ -113,10 +113,10 @@ lane_y_end: 1.0 # (float) normalized y of the last row anchor for labels without
+ lane_letterbox: False # (bool) preserve aspect ratio and pad instead of stretching directly
+ lane_letterbox_color: [0, 0, 0] # (list[int]) three-channel LetterBox padding color
+ lane_letterbox_bottom_align: True # (bool) place all vertical padding above the image; horizontal padding stays centered
+-lane_reduce_channels: 8 # (int) Conv1x1 output channels in the exact YOLOP model.34-style lane head
++lane_reduce_channels: 16 # (int) Conv1x1 output channels in the LaneRobotV3B lane head
+ lane_hidden_dim: 512 # (int) hidden dimension of the first FC layer in the lane head
+-lane_feat_h: 8 # (int) fixed feature height before flatten; original model uses 8 for 256x320 input at stride 32
+-lane_feat_w: 10 # (int) fixed feature width before flatten; original model uses 10 for 256x320 input at stride 32
++lane_feat_h: 16 # (int) fixed feature height before flatten; LaneRobotV3B uses 16 for 256x448 input at stride 16
++lane_feat_w: 28 # (int) fixed feature width before flatten; LaneRobotV3B uses 28 for 256x448 input at stride 16
+ lane_ce: 1.0 # (float) row-anchor x-class cross-entropy loss gain
+ lane_loc: 2.0 # (float) expected-x SmoothL1 loss gain for visible points
+ lane_exist: 1.5 # (float) auxiliary lane-existence BCE loss gain
+diff --git a/ultralytics/cfg/models/26/yolo26s-lane-v3b.yaml b/ultralytics/cfg/models/26/yolo26s-lane-v3b.yaml
+new file mode 100644
+index 0000000..b8bdc88
+--- /dev/null
++++ b/ultralytics/cfg/models/26/yolo26s-lane-v3b.yaml
+@@ -0,0 +1,55 @@
++# Ultralytics 🚀 AGPL-3.0 License
++
++# YOLO26 LaneRobotV3B model: P4+P5 fusion + per-lane row-shared classifiers.
++# Same backbone/neck and output protocol as yolo26s-lane.yaml, but the head is
++# replaced by LaneRobotV3B:
++#   conv_1x1 256->16 -> bilinear row sampling (56 anchor rows)
++#   -> per-row flatten (16x28) + row mean -> 464 -> proj 464->512
++#   -> + row embedding -> 4 per-lane cls (512->321) + 4 per-lane offset (512->1)
++# Target input: 256x448 (H=256, W=448), both divisible by 32.
++# Output: {cls: [B, x_grids+1, row_anchors, num_lanes], offset: [B, 1, row_anchors, num_lanes]}.
++
++# Parameters
++nc: 4
++task: lane
++x_grids: 320
++row_anchors: 56
++num_lanes: 4
++reduce_channels: 16
++hidden_dim: 512
++feat_h: 16
++feat_w: 28
++y_start: 0.333333
++y_end: 1.0
++scales:
++  n: [0.50, 0.25, 1024]
++  s: [0.50, 0.50, 1024]
++  m: [0.50, 1.00, 512]
++  l: [1.00, 1.00, 512]
++  x: [1.00, 1.50, 512]
++
++backbone:
++  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
++  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
++  - [-1, 2, C3k2, [256, False, 0.25]]
++  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
++  - [-1, 2, C3k2, [512, False, 0.25]]
++  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
++  - [-1, 2, C3k2, [512, True]]
++  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
++  - [-1, 2, C3k2, [1024, True]]
++  - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
++  - [-1, 2, C2PSA, [1024]] # 10, stride-32 deep feature
++
++head:
++  # P5 / stride-32 semantic feature reduction
++  - [10, 1, Conv, [256, 1, 1]] # 11
++  # Upsample P5 to P4 scale
++  - [-1, 1, nn.Upsample, [None, 2, nearest]] # 12
++  # P4 / stride-16 spatial feature reduction
++  - [6, 1, Conv, [256, 1, 1]] # 13
++  # P4 + P5 multi-scale fusion
++  - [[-1, -2], 1, Concat, [1]] # 14
++  - [-1, 1, Conv, [512, 3, 1]] # 15
++  # LaneRobotV3B head: shared row features + per-lane classifiers
++  - [-1, 1, LaneRobotV3B, [x_grids, row_anchors, num_lanes, reduce_channels, hidden_dim, feat_h, feat_w, y_start, y_end]] # 16
+diff --git a/ultralytics/models/yolo/lane/dataset.py b/ultralytics/models/yolo/lane/dataset.py
+index 9a8dd4d..67f2f68 100644
+--- a/ultralytics/models/yolo/lane/dataset.py
++++ b/ultralytics/models/yolo/lane/dataset.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from pathlib import Path
+ 
+ import cv2
+@@ -116,7 +117,8 @@ class LaneRobotDataset(Dataset):
+         if self.label_dir:
+             self.label_dir = Path(self.label_dir)
+             if not self.label_dir.is_absolute():
+-                self.label_dir = Path(data.get("path", ".")) / self.label_dir
++                root = Path(os.environ.get("LANE_ROBOT_DATASETS", data.get("path", ".")))
++                self.label_dir = root.expanduser() / self.label_dir
+ 
+         self.im_files = self._scan_images(self.img_path)
+         if not self.im_files:
+diff --git a/ultralytics/models/yolo/lane/train.py b/ultralytics/models/yolo/lane/train.py
+index ece57df..202d9b9 100644
+--- a/ultralytics/models/yolo/lane/train.py
++++ b/ultralytics/models/yolo/lane/train.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from copy import copy, deepcopy
+ from pathlib import Path
+ from typing import Any
+@@ -30,7 +31,8 @@ class LaneRobotTrainer(BaseTrainer):
+ 
+     def get_dataset(self):
+         data = YAML.load(self.args.data) if isinstance(self.args.data, (str, Path)) else dict(self.args.data)
+-        root = Path(data.get("path", ".")).expanduser()
++        # LANE_ROBOT_DATASETS overrides the YAML path so checkouts don't need editing.
++        root = Path(os.environ.get("LANE_ROBOT_DATASETS", data.get("path", "."))).expanduser()
+         for k in ("train", "val", "test"):
+             if data.get(k) and not Path(data[k]).is_absolute():
+                 data[k] = str(root / data[k])
+diff --git a/ultralytics/models/yolo/lane/val.py b/ultralytics/models/yolo/lane/val.py
+index a9041aa..4b81bf6 100644
+--- a/ultralytics/models/yolo/lane/val.py
++++ b/ultralytics/models/yolo/lane/val.py
+@@ -12,8 +12,8 @@ from ultralytics.utils import LOGGER
+ 
+ 
+ def get_lane_head(model):
+-    """Return the LaneRobot/LaneRobotV2 head from a wrapped, fused, EMA, or raw model object."""
+-    from ultralytics.nn.modules.head import LaneRobot, LaneRobotV2
++    """Return the LaneRobot/LaneRobotV2/LaneRobotV3B head from a wrapped, fused, EMA, or raw model object."""
++    from ultralytics.nn.modules.head import LaneRobot, LaneRobotV2, LaneRobotV3B
+ 
+     seen = set()
+ 
+@@ -24,7 +24,7 @@ def get_lane_head(model):
+         if oid in seen:
+             return None
+         seen.add(oid)
+-        if isinstance(obj, (LaneRobot, LaneRobotV2)):
++        if isinstance(obj, (LaneRobot, LaneRobotV2, LaneRobotV3B)):
+             return obj
+         seq = None
+         if isinstance(obj, (list, tuple, torch.nn.ModuleList, torch.nn.Sequential)):
+@@ -40,13 +40,13 @@ def get_lane_head(model):
+                     return found
+         if isinstance(obj, torch.nn.Module):
+             for m in obj.modules():
+-                if isinstance(m, (LaneRobot, LaneRobotV2)):
++                if isinstance(m, (LaneRobot, LaneRobotV2, LaneRobotV3B)):
+                     return m
+         return None
+ 
+     head = walk(model)
+     if head is None:
+-        raise AttributeError("Could not locate LaneRobot/LaneRobotV2 head on validator model.")
++        raise AttributeError("Could not locate LaneRobot/LaneRobotV2/LaneRobotV3B head on validator model.")
+     return head
+ 
+ 
+@@ -68,13 +68,31 @@ class LaneRobotMetrics:
+         self.lane_acc_valid_tol3 = 0.0
+         self.lane_acc_valid_tol5 = 0.0
+         self.lane_exist_acc = 0.0
++        self.num_lanes = 0
+         self.fitness = 0.0
+         self.speed = None
+         self.save_dir = None
+ 
++    def add_lane_metrics(self, num_lanes: int) -> None:
++        """Register per-lane metric keys and attributes (idempotent)."""
++        num_lanes = int(num_lanes)
++        if self.num_lanes == num_lanes:
++            return
++        self.num_lanes = num_lanes
++        for lane_id in range(num_lanes):
++            self.keys += [
++                f"metrics/lane{lane_id}_mae",
++                f"metrics/lane{lane_id}_acc_valid_tol1",
++                f"metrics/lane{lane_id}_acc_valid_tol3",
++                f"metrics/lane{lane_id}_acc_valid_tol5",
++                f"metrics/lane{lane_id}_exist_acc",
++            ]
++            for suffix in ("mae", "acc_valid_tol1", "acc_valid_tol3", "acc_valid_tol5", "exist_acc"):
++                setattr(self, f"lane{lane_id}_{suffix}", 0.0)
++
+     @property
+     def results_dict(self):
+-        return {
++        results = {
+             "metrics/lane_mae": self.lane_mae,
+             "metrics/lane_mae_px": self.lane_mae_px,
+             "metrics/lane_acc_valid_tol1": self.lane_acc_valid_tol1,
+@@ -83,9 +101,25 @@ class LaneRobotMetrics:
+             "metrics/lane_exist_acc": self.lane_exist_acc,
+             "fitness": self.fitness,
+         }
++        for lane_id in range(self.num_lanes):
++            results[f"metrics/lane{lane_id}_mae"] = getattr(self, f"lane{lane_id}_mae", 0.0)
++            results[f"metrics/lane{lane_id}_acc_valid_tol1"] = getattr(self, f"lane{lane_id}_acc_valid_tol1", 0.0)
++            results[f"metrics/lane{lane_id}_acc_valid_tol3"] = getattr(self, f"lane{lane_id}_acc_valid_tol3", 0.0)
++            results[f"metrics/lane{lane_id}_acc_valid_tol5"] = getattr(self, f"lane{lane_id}_acc_valid_tol5", 0.0)
++            results[f"metrics/lane{lane_id}_exist_acc"] = getattr(self, f"lane{lane_id}_exist_acc", 0.0)
++        return results
+ 
+     def mean_results(self):
+-        return [self.lane_mae, self.lane_mae_px, self.lane_acc_valid_tol1, self.lane_acc_valid_tol3, self.lane_acc_valid_tol5, self.lane_exist_acc]
++        results = [self.lane_mae, self.lane_mae_px, self.lane_acc_valid_tol1, self.lane_acc_valid_tol3, self.lane_acc_valid_tol5, self.lane_exist_acc]
++        for lane_id in range(self.num_lanes):
++            results += [
++                getattr(self, f"lane{lane_id}_mae", 0.0),
++                getattr(self, f"lane{lane_id}_acc_valid_tol1", 0.0),
++                getattr(self, f"lane{lane_id}_acc_valid_tol3", 0.0),
++                getattr(self, f"lane{lane_id}_acc_valid_tol5", 0.0),
++                getattr(self, f"lane{lane_id}_exist_acc", 0.0),
++            ]
++        return results
+ 
+ 
+ class LaneRobotValidator(BaseValidator):
+@@ -137,6 +171,7 @@ class LaneRobotValidator(BaseValidator):
+         self.x_grids = int(head.x_grids)
+         self.row_anchors = int(head.row_anchors)
+         self.num_lanes = int(head.num_lanes)
++        self.metrics.add_lane_metrics(self.num_lanes)
+         self.no_lane_idx = self.x_grids
+         self.mae_sum = 0.0
+         self.mae_px_sum = 0.0
+@@ -146,6 +181,13 @@ class LaneRobotValidator(BaseValidator):
+         self.tol5 = 0
+         self.exist_correct = 0
+         self.exist_total = 0
++        self.lane_mae_sum = [0.0] * self.num_lanes
++        self.lane_valid_total = [0] * self.num_lanes
++        self.lane_tol1 = [0] * self.num_lanes
++        self.lane_tol3 = [0] * self.num_lanes
++        self.lane_tol5 = [0] * self.num_lanes
++        self.lane_exist_correct = [0] * self.num_lanes
++        self.lane_exist_total = [0] * self.num_lanes
+ 
+     def _split_preds(self, preds):
+         if isinstance(preds, dict):
+@@ -184,6 +226,19 @@ class LaneRobotValidator(BaseValidator):
+         self.exist_correct += int((pred_valid == valid).sum().item())
+         self.exist_total += int(valid.numel())
+ 
++        for lane_id in range(self.num_lanes):
++            valid_l = valid[:, :, lane_id]
++            pred_valid_l = pred_valid[:, :, lane_id]
++            if valid_l.any():
++                err_l = (pred_x[:, :, lane_id][valid_l] - target_x[:, :, lane_id][valid_l]).abs()
++                self.lane_mae_sum[lane_id] += float(err_l.sum().item())
++                self.lane_valid_total[lane_id] += int(valid_l.sum().item())
++                self.lane_tol1[lane_id] += int((err_l <= 1).sum().item())
++                self.lane_tol3[lane_id] += int((err_l <= 3).sum().item())
++                self.lane_tol5[lane_id] += int((err_l <= 5).sum().item())
++            self.lane_exist_correct[lane_id] += int((pred_valid_l == valid_l).sum().item())
++            self.lane_exist_total[lane_id] += int(valid_l.numel())
++
+     def get_stats(self):
+         valid_total = max(self.valid_total, 1)
+         mae = self.mae_sum / valid_total
+@@ -198,6 +253,29 @@ class LaneRobotValidator(BaseValidator):
+         self.metrics.lane_acc_valid_tol3 = float(tol3)
+         self.metrics.lane_acc_valid_tol5 = float(tol5)
+         self.metrics.lane_exist_acc = float(exist_acc)
++        for lane_id in range(self.num_lanes):
++            lane_valid_total = max(self.lane_valid_total[lane_id], 1)
++            setattr(self.metrics, f"lane{lane_id}_mae", float(self.lane_mae_sum[lane_id] / lane_valid_total))
++            setattr(
++                self.metrics,
++                f"lane{lane_id}_acc_valid_tol1",
++                float(self.lane_tol1[lane_id] / lane_valid_total),
++            )
++            setattr(
++                self.metrics,
++                f"lane{lane_id}_acc_valid_tol3",
++                float(self.lane_tol3[lane_id] / lane_valid_total),
++            )
++            setattr(
++                self.metrics,
++                f"lane{lane_id}_acc_valid_tol5",
++                float(self.lane_tol5[lane_id] / lane_valid_total),
++            )
++            setattr(
++                self.metrics,
++                f"lane{lane_id}_exist_acc",
++                float(self.lane_exist_correct[lane_id] / max(self.lane_exist_total[lane_id], 1)),
++            )
+         self.metrics.fitness = float(tol3 + 0.5 * tol5 - 0.003 * mae + 0.05 * exist_acc)
+         return self.metrics.results_dict
+ 
+@@ -215,6 +293,14 @@ class LaneRobotValidator(BaseValidator):
+             f"Acc@5={stats['metrics/lane_acc_valid_tol5']:.4f}, "
+             f"Exist={stats['metrics/lane_exist_acc']:.4f}"
+         )
++        for lane_id in range(self.num_lanes):
++            LOGGER.info(
++                f"Lane{lane_id} MAE={stats[f'metrics/lane{lane_id}_mae']:.3f}, "
++                f"Acc@1={stats[f'metrics/lane{lane_id}_acc_valid_tol1']:.4f}, "
++                f"Acc@3={stats[f'metrics/lane{lane_id}_acc_valid_tol3']:.4f}, "
++                f"Acc@5={stats[f'metrics/lane{lane_id}_acc_valid_tol5']:.4f}, "
++                f"Exist={stats[f'metrics/lane{lane_id}_exist_acc']:.4f}"
++            )
+ 
+     def get_desc(self):
+         return ("%22s" + "%11s" * 6) % ("lane", "mae", "mae_px", "acc@1", "acc@3", "acc@5", "exist")
+diff --git a/ultralytics/nn/modules/__init__.py b/ultralytics/nn/modules/__init__.py
+index 19d6cd1..7022a52 100644
+--- a/ultralytics/nn/modules/__init__.py
++++ b/ultralytics/nn/modules/__init__.py
+@@ -84,6 +84,7 @@ from .head import (
+     LRPCHead,
+     LaneRobot,
+     LaneRobotV2,
++    LaneRobotV3B,
+     Pose,
+     Pose26,
+     RTDETRDecoder,
+@@ -164,6 +165,7 @@ __all__ = (
+     "LRPCHead",
+     "LaneRobot",
+     "LaneRobotV2",
++    "LaneRobotV3B",
+     "LayerNorm2d",
+     "LightConv",
+     "MLPBlock",
+diff --git a/ultralytics/nn/modules/head.py b/ultralytics/nn/modules/head.py
+index 55c08d2..e9c48bf 100644
+--- a/ultralytics/nn/modules/head.py
++++ b/ultralytics/nn/modules/head.py
+@@ -1898,3 +1898,112 @@ class LaneRobotV2(nn.Module):
+         if self.export:
+             return torch.cat((cls, offset), dim=1)
+         return {"cls": cls, "offset": offset}
++
++
++class LaneRobotV3B(nn.Module):
++    """Row-anchor lane head with per-lane classifiers shared across row anchors.
++
++    Plan-B head for the LaneRobot V3 redesign:
++        Conv1x1 (reduce channels)
++        -> fixed bilinear row sampling (bottom-to-top row anchors, grouped conv)
++        -> per-row flatten + row-mean concat
++        -> shared projection 464->hidden_dim + ReLU
++        -> shared row embedding
++        -> 4 per-lane classifiers (hidden_dim -> x_grids+1), each shared across rows
++        -> 4 per-lane offset heads (hidden_dim -> 1)
++
++    Keeps the exact V2 output protocol:
++        {"cls": [B, x_grids+1, row_anchors, num_lanes],
++         "offset": [B, 1, row_anchors, num_lanes]}
++    """
++
++    export = False
++
++    def __init__(
++        self,
++        x_grids: int = 320,
++        row_anchors: int = 56,
++        num_lanes: int = 4,
++        reduce_channels: int = 16,
++        hidden_dim: int = 512,
++        feat_h: int = 16,
++        feat_w: int = 28,
++        y_start: float = 0.333333,
++        y_end: float = 1.0,
++        ch: tuple = (),
++    ):
++        super().__init__()
++        c1 = ch[0] if isinstance(ch, (tuple, list)) else int(ch)
++        self.x_grids = int(x_grids)
++        self.row_anchors = int(row_anchors)
++        self.num_lanes = int(num_lanes)
++        self.reduce_channels = int(reduce_channels)
++        self.hidden_dim = int(hidden_dim)
++        self.feat_h = int(feat_h)
++        self.feat_w = int(feat_w)
++        self.y_start = float(y_start)
++        self.y_end = float(y_end)
++        self.no_lane_idx = self.x_grids
++        self.out_shape = (self.x_grids + 1, self.row_anchors, self.num_lanes)
++
++        self.conv_1x1 = nn.Conv2d(c1, self.reduce_channels, kernel_size=1, stride=1, padding=0, bias=True)
++        self._build_row_sampler(self.feat_h)
++
++        row_dim = self.reduce_channels * self.feat_w + self.reduce_channels  # columns + row mean
++        self.proj = nn.Linear(row_dim, self.hidden_dim)
++        self.act = nn.ReLU(inplace=False)
++        self.row_embed = nn.Parameter(torch.zeros(self.row_anchors, self.hidden_dim))
++        self.cls_heads = nn.ModuleList(nn.Linear(self.hidden_dim, self.x_grids + 1) for _ in range(self.num_lanes))
++        self.offset_heads = nn.ModuleList(nn.Linear(self.hidden_dim, 1) for _ in range(self.num_lanes))
++        for layer in (self.proj, *self.cls_heads, *self.offset_heads):
++            linear_init(layer)
++
++    def _build_row_sampler(self, feat_h: int) -> None:
++        """Build the fixed bilinear bottom-to-top row-sampling matrix and its grouped-conv form."""
++        h = int(feat_h)
++        r = self.row_anchors
++        # Anchor rows are stored bottom-to-top: r=0 -> y_end (image bottom), r=R-1 -> y_start.
++        y = torch.linspace(self.y_end, self.y_start, r, dtype=torch.float32)
++        p = y * (h - 1)
++        i0 = torch.clamp(torch.floor(p).long(), 0, h - 1)
++        i1 = torch.clamp(i0 + 1, 0, h - 1)
++        w1 = (p - i0.float()).clamp(0.0, 1.0)
++        w0 = 1.0 - w1
++        matrix = torch.zeros(r, h, dtype=torch.float32)
++        matrix.scatter_(1, i0.unsqueeze(1), w0.unsqueeze(1))
++        matrix.scatter_add_(1, i1.unsqueeze(1), w1.unsqueeze(1))
++        self.register_buffer("row_mix", matrix)
++        # Grouped-conv view: one shared [R, feat_h] matrix per input channel.
++        conv_w = matrix.unsqueeze(1).unsqueeze(-1).repeat(self.reduce_channels, 1, 1, 1)
++        self.register_buffer("row_conv_w", conv_w)
++
++    def _sample_rows(self, x: torch.Tensor) -> torch.Tensor:
++        """Sample one feature vector per anchor row from a [B,C,H,W] tensor."""
++        b, c, h, w = x.shape
++        x = F.conv2d(x, self.row_conv_w, groups=c)  # [B, C*R, 1, W]
++        return x.view(b, c, self.row_anchors, w)
++
++    def forward(self, x):
++        """Forward through the V3-B head, returning the V2-compatible cls/offset dict."""
++        x = self.conv_1x1(x)
++        if x.shape[-2:] != (self.feat_h, self.feat_w):
++            # Fallback for non-canonical input sizes; train/export with a fixed imgsz for parity.
++            x = F.adaptive_avg_pool2d(x, (self.feat_h, self.feat_w))
++
++        xs = self._sample_rows(x)  # [B, C, R, W]
++        b, c, r, w = xs.shape
++        row_feat = xs.permute(0, 2, 1, 3).reshape(b, r, c * w)  # [B, R, C*W]
++        row_mean = xs.mean(dim=-1).permute(0, 2, 1)  # [B, R, C]
++        row_feat = torch.cat((row_feat, row_mean), dim=-1)  # [B, R, C*W + C]
++
++        z = self.act(self.proj(row_feat))  # [B, R, hidden_dim]
++        z = z + self.row_embed.unsqueeze(0)
++
++        cls = torch.stack([head(z) for head in self.cls_heads], dim=2)  # [B, R, L, X+1]
++        offset = torch.stack([head(z) for head in self.offset_heads], dim=2)  # [B, R, L, 1]
++        cls = cls.permute(0, 3, 1, 2).contiguous()  # [B, X+1, R, L]
++        offset = torch.tanh(offset).permute(0, 3, 1, 2).contiguous() * 0.5  # [B, 1, R, L]
++
++        if self.export:
++            return torch.cat((cls, offset), dim=1)
++        return {"cls": cls, "offset": offset}
+diff --git a/ultralytics/nn/tasks.py b/ultralytics/nn/tasks.py
+index 33b436f..d70267a 100644
+--- a/ultralytics/nn/tasks.py
++++ b/ultralytics/nn/tasks.py
+@@ -57,6 +57,7 @@ from ultralytics.nn.modules import (
+     LRPCHead,
+     LaneRobot,
+     LaneRobotV2,
++    LaneRobotV3B,
+     Pose,
+     Pose26,
+     RepC3,
+@@ -1715,7 +1716,7 @@ def parse_model(d, ch, verbose=True):
+                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+             if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
+                 m.legacy = legacy
+-        elif m in {LaneRobot, LaneRobotV2}:
++        elif m in {LaneRobot, LaneRobotV2, LaneRobotV3B}:
+             args.append([ch[f] if isinstance(f, int) else [ch[x] for x in f]])
+             c2 = args[0] + 1  # output class dimension; full output is [B, x_grids+1, row_anchors, num_lanes]
+         elif m is v10Detect:
+@@ -1836,7 +1837,7 @@ def guess_model_task(model):
+                 return "pose"
+             elif isinstance(m, OBB):
+                 return "obb"
+-            elif isinstance(m, (LaneRobot, LaneRobotV2)):
++            elif isinstance(m, (LaneRobot, LaneRobotV2, LaneRobotV3B)):
+                 return "lane"
+             elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
+                 return "detect"
+diff --git a/ultralytics/utils/loss.py b/ultralytics/utils/loss.py
+index 0bfdb15..efbfa7b 100644
+--- a/ultralytics/utils/loss.py
++++ b/ultralytics/utils/loss.py
+@@ -1345,7 +1345,9 @@ class LaneRobotLoss:
+             return logits.sum() * 0.0
+         c = logits.shape[1]
+         grid = torch.arange(c, device=logits.device, dtype=logits.dtype).view(1, c, 1, 1)
+-        target_float = target_x.clamp(0, self.x_grids - 1).unsqueeze(1)
++        # Soft labels center on the nearest integer grid so that classification and
++        # the residual offset (target_x - round(target_x)) are mutually consistent.
++        target_float = target_x.round().clamp(0, self.x_grids - 1).unsqueeze(1)
+         soft = torch.exp(-0.5 * ((grid - target_float) / max(self.soft_sigma, 1e-6)) ** 2)
+         soft[:, self.no_lane_idx : self.no_lane_idx + 1] = 0.0
+         soft = soft / soft.sum(dim=1, keepdim=True).clamp_min(1e-6)
+@@ -1382,7 +1384,7 @@ class LaneRobotLoss:
+             loc = logits.sum() * 0.0
+ 
+         if offset is not None and valid.any():
+-            base = target_x.floor().clamp(0, self.x_grids - 1)
++            base = target_x.round().clamp(0, self.x_grids - 1)
+             off_t = (target_x - base).clamp(-0.5, 0.5)
+             offset_loss = F.smooth_l1_loss(offset.squeeze(1)[valid], off_t[valid])
+         else:
+-- 
+2.34.1
+

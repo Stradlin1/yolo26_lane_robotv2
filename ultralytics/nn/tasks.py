@@ -57,6 +57,7 @@ from ultralytics.nn.modules import (
     LRPCHead,
     LaneRobot,
     LaneRobotV2,
+    LaneRobotV3B,
     Pose,
     Pose26,
     RepC3,
@@ -1715,7 +1716,7 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:
                 m.legacy = legacy
-        elif m in {LaneRobot, LaneRobotV2}:
+        elif m in {LaneRobot, LaneRobotV2, LaneRobotV3B}:
             args.append([ch[f] if isinstance(f, int) else [ch[x] for x in f]])
             c2 = args[0] + 1  # output class dimension; full output is [B, x_grids+1, row_anchors, num_lanes]
         elif m is v10Detect:
@@ -1836,7 +1837,7 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (LaneRobot, LaneRobotV2)):
+            elif isinstance(m, (LaneRobot, LaneRobotV2, LaneRobotV3B)):
                 return "lane"
             elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
                 return "detect"

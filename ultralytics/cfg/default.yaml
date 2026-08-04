@@ -113,10 +113,10 @@ lane_y_end: 1.0 # (float) normalized y of the last row anchor for labels without
 lane_letterbox: False # (bool) preserve aspect ratio and pad instead of stretching directly
 lane_letterbox_color: [0, 0, 0] # (list[int]) three-channel LetterBox padding color
 lane_letterbox_bottom_align: True # (bool) place all vertical padding above the image; horizontal padding stays centered
-lane_reduce_channels: 8 # (int) Conv1x1 output channels in the exact YOLOP model.34-style lane head
+lane_reduce_channels: 16 # (int) Conv1x1 output channels in the LaneRobotV3B lane head
 lane_hidden_dim: 512 # (int) hidden dimension of the first FC layer in the lane head
-lane_feat_h: 8 # (int) fixed feature height before flatten; original model uses 8 for 256x320 input at stride 32
-lane_feat_w: 10 # (int) fixed feature width before flatten; original model uses 10 for 256x320 input at stride 32
+lane_feat_h: 16 # (int) fixed feature height before flatten; LaneRobotV3B uses 16 for 256x448 input at stride 16
+lane_feat_w: 28 # (int) fixed feature width before flatten; LaneRobotV3B uses 28 for 256x448 input at stride 16
 lane_ce: 1.0 # (float) row-anchor x-class cross-entropy loss gain
 lane_loc: 2.0 # (float) expected-x SmoothL1 loss gain for visible points
 lane_exist: 1.5 # (float) auxiliary lane-existence BCE loss gain

@@ -1345,7 +1345,9 @@ class LaneRobotLoss:
             return logits.sum() * 0.0
         c = logits.shape[1]
         grid = torch.arange(c, device=logits.device, dtype=logits.dtype).view(1, c, 1, 1)
-        target_float = target_x.clamp(0, self.x_grids - 1).unsqueeze(1)
+        # Soft labels center on the nearest integer grid so that classification and
+        # the residual offset (target_x - round(target_x)) are mutually consistent.
+        target_float = target_x.round().clamp(0, self.x_grids - 1).unsqueeze(1)
         soft = torch.exp(-0.5 * ((grid - target_float) / max(self.soft_sigma, 1e-6)) ** 2)
         soft[:, self.no_lane_idx : self.no_lane_idx + 1] = 0.0
         soft = soft / soft.sum(dim=1, keepdim=True).clamp_min(1e-6)
@@ -1382,7 +1384,7 @@ class LaneRobotLoss:
             loc = logits.sum() * 0.0
 
         if offset is not None and valid.any():
-            base = target_x.floor().clamp(0, self.x_grids - 1)
+            base = target_x.round().clamp(0, self.x_grids - 1)
             off_t = (target_x - base).clamp(-0.5, 0.5)
             offset_loss = F.smooth_l1_loss(offset.squeeze(1)[valid], off_t[valid])
         else:

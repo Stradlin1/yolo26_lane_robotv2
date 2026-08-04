@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import cv2
@@ -116,7 +117,8 @@ class LaneRobotDataset(Dataset):
         if self.label_dir:
             self.label_dir = Path(self.label_dir)
             if not self.label_dir.is_absolute():
-                self.label_dir = Path(data.get("path", ".")) / self.label_dir
+                root = Path(os.environ.get("LANE_ROBOT_DATASETS", data.get("path", ".")))
+                self.label_dir = root.expanduser() / self.label_dir
 
         self.im_files = self._scan_images(self.img_path)
         if not self.im_files:

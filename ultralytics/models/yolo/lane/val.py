@@ -12,8 +12,8 @@ from ultralytics.utils import LOGGER
 
 
 def get_lane_head(model):
-    """Return the LaneRobot/LaneRobotV2 head from a wrapped, fused, EMA, or raw model object."""
-    from ultralytics.nn.modules.head import LaneRobot, LaneRobotV2
+    """Return the LaneRobot/LaneRobotV2/LaneRobotV3B head from a wrapped, fused, EMA, or raw model object."""
+    from ultralytics.nn.modules.head import LaneRobot, LaneRobotV2, LaneRobotV3B
 
     seen = set()
 
@@ -24,7 +24,7 @@ def get_lane_head(model):
         if oid in seen:
             return None
         seen.add(oid)
-        if isinstance(obj, (LaneRobot, LaneRobotV2)):
+        if isinstance(obj, (LaneRobot, LaneRobotV2, LaneRobotV3B)):
             return obj
         seq = None
         if isinstance(obj, (list, tuple, torch.nn.ModuleList, torch.nn.Sequential)):
@@ -40,13 +40,13 @@ def get_lane_head(model):
                     return found
         if isinstance(obj, torch.nn.Module):
             for m in obj.modules():
-                if isinstance(m, (LaneRobot, LaneRobotV2)):
+                if isinstance(m, (LaneRobot, LaneRobotV2, LaneRobotV3B)):
                     return m
         return None
 
     head = walk(model)
     if head is None:
-        raise AttributeError("Could not locate LaneRobot/LaneRobotV2 head on validator model.")
+        raise AttributeError("Could not locate LaneRobot/LaneRobotV2/LaneRobotV3B head on validator model.")
     return head
 
 
@@ -68,13 +68,31 @@ class LaneRobotMetrics:
         self.lane_acc_valid_tol3 = 0.0
         self.lane_acc_valid_tol5 = 0.0
         self.lane_exist_acc = 0.0
+        self.num_lanes = 0
         self.fitness = 0.0
         self.speed = None
         self.save_dir = None
 
+    def add_lane_metrics(self, num_lanes: int) -> None:
+        """Register per-lane metric keys and attributes (idempotent)."""
+        num_lanes = int(num_lanes)
+        if self.num_lanes == num_lanes:
+            return
+        self.num_lanes = num_lanes
+        for lane_id in range(num_lanes):
+            self.keys += [
+                f"metrics/lane{lane_id}_mae",
+                f"metrics/lane{lane_id}_acc_valid_tol1",
+                f"metrics/lane{lane_id}_acc_valid_tol3",
+                f"metrics/lane{lane_id}_acc_valid_tol5",
+                f"metrics/lane{lane_id}_exist_acc",
+            ]
+            for suffix in ("mae", "acc_valid_tol1", "acc_valid_tol3", "acc_valid_tol5", "exist_acc"):
+                setattr(self, f"lane{lane_id}_{suffix}", 0.0)
+
     @property
     def results_dict(self):
-        return {
+        results = {
             "metrics/lane_mae": self.lane_mae,
             "metrics/lane_mae_px": self.lane_mae_px,
             "metrics/lane_acc_valid_tol1": self.lane_acc_valid_tol1,
@@ -83,9 +101,25 @@ class LaneRobotMetrics:
             "metrics/lane_exist_acc": self.lane_exist_acc,
             "fitness": self.fitness,
         }
+        for lane_id in range(self.num_lanes):
+            results[f"metrics/lane{lane_id}_mae"] = getattr(self, f"lane{lane_id}_mae", 0.0)
+            results[f"metrics/lane{lane_id}_acc_valid_tol1"] = getattr(self, f"lane{lane_id}_acc_valid_tol1", 0.0)
+            results[f"metrics/lane{lane_id}_acc_valid_tol3"] = getattr(self, f"lane{lane_id}_acc_valid_tol3", 0.0)
+            results[f"metrics/lane{lane_id}_acc_valid_tol5"] = getattr(self, f"lane{lane_id}_acc_valid_tol5", 0.0)
+            results[f"metrics/lane{lane_id}_exist_acc"] = getattr(self, f"lane{lane_id}_exist_acc", 0.0)
+        return results
 
     def mean_results(self):
-        return [self.lane_mae, self.lane_mae_px, self.lane_acc_valid_tol1, self.lane_acc_valid_tol3, self.lane_acc_valid_tol5, self.lane_exist_acc]
+        results = [self.lane_mae, self.lane_mae_px, self.lane_acc_valid_tol1, self.lane_acc_valid_tol3, self.lane_acc_valid_tol5, self.lane_exist_acc]
+        for lane_id in range(self.num_lanes):
+            results += [
+                getattr(self, f"lane{lane_id}_mae", 0.0),
+                getattr(self, f"lane{lane_id}_acc_valid_tol1", 0.0),
+                getattr(self, f"lane{lane_id}_acc_valid_tol3", 0.0),
+                getattr(self, f"lane{lane_id}_acc_valid_tol5", 0.0),
+                getattr(self, f"lane{lane_id}_exist_acc", 0.0),
+            ]
+        return results
 
 
 class LaneRobotValidator(BaseValidator):
@@ -137,6 +171,7 @@ class LaneRobotValidator(BaseValidator):
         self.x_grids = int(head.x_grids)
         self.row_anchors = int(head.row_anchors)
         self.num_lanes = int(head.num_lanes)
+        self.metrics.add_lane_metrics(self.num_lanes)
         self.no_lane_idx = self.x_grids
         self.mae_sum = 0.0
         self.mae_px_sum = 0.0
@@ -146,6 +181,13 @@ class LaneRobotValidator(BaseValidator):
         self.tol5 = 0
         self.exist_correct = 0
         self.exist_total = 0
+        self.lane_mae_sum = [0.0] * self.num_lanes
+        self.lane_valid_total = [0] * self.num_lanes
+        self.lane_tol1 = [0] * self.num_lanes
+        self.lane_tol3 = [0] * self.num_lanes
+        self.lane_tol5 = [0] * self.num_lanes
+        self.lane_exist_correct = [0] * self.num_lanes
+        self.lane_exist_total = [0] * self.num_lanes
 
     def _split_preds(self, preds):
         if isinstance(preds, dict):
@@ -184,6 +226,19 @@ class LaneRobotValidator(BaseValidator):
         self.exist_correct += int((pred_valid == valid).sum().item())
         self.exist_total += int(valid.numel())
 
+        for lane_id in range(self.num_lanes):
+            valid_l = valid[:, :, lane_id]
+            pred_valid_l = pred_valid[:, :, lane_id]
+            if valid_l.any():
+                err_l = (pred_x[:, :, lane_id][valid_l] - target_x[:, :, lane_id][valid_l]).abs()
+                self.lane_mae_sum[lane_id] += float(err_l.sum().item())
+                self.lane_valid_total[lane_id] += int(valid_l.sum().item())
+                self.lane_tol1[lane_id] += int((err_l <= 1).sum().item())
+                self.lane_tol3[lane_id] += int((err_l <= 3).sum().item())
+                self.lane_tol5[lane_id] += int((err_l <= 5).sum().item())
+            self.lane_exist_correct[lane_id] += int((pred_valid_l == valid_l).sum().item())
+            self.lane_exist_total[lane_id] += int(valid_l.numel())
+
     def get_stats(self):
         valid_total = max(self.valid_total, 1)
         mae = self.mae_sum / valid_total
@@ -198,6 +253,29 @@ class LaneRobotValidator(BaseValidator):
         self.metrics.lane_acc_valid_tol3 = float(tol3)
         self.metrics.lane_acc_valid_tol5 = float(tol5)
         self.metrics.lane_exist_acc = float(exist_acc)
+        for lane_id in range(self.num_lanes):
+            lane_valid_total = max(self.lane_valid_total[lane_id], 1)
+            setattr(self.metrics, f"lane{lane_id}_mae", float(self.lane_mae_sum[lane_id] / lane_valid_total))
+            setattr(
+                self.metrics,
+                f"lane{lane_id}_acc_valid_tol1",
+                float(self.lane_tol1[lane_id] / lane_valid_total),
+            )
+            setattr(
+                self.metrics,
+                f"lane{lane_id}_acc_valid_tol3",
+                float(self.lane_tol3[lane_id] / lane_valid_total),
+            )
+            setattr(
+                self.metrics,
+                f"lane{lane_id}_acc_valid_tol5",
+                float(self.lane_tol5[lane_id] / lane_valid_total),
+            )
+            setattr(
+                self.metrics,
+                f"lane{lane_id}_exist_acc",
+                float(self.lane_exist_correct[lane_id] / max(self.lane_exist_total[lane_id], 1)),
+            )
         self.metrics.fitness = float(tol3 + 0.5 * tol5 - 0.003 * mae + 0.05 * exist_acc)
         return self.metrics.results_dict
 
@@ -215,6 +293,14 @@ class LaneRobotValidator(BaseValidator):
             f"Acc@5={stats['metrics/lane_acc_valid_tol5']:.4f}, "
             f"Exist={stats['metrics/lane_exist_acc']:.4f}"
         )
+        for lane_id in range(self.num_lanes):
+            LOGGER.info(
+                f"Lane{lane_id} MAE={stats[f'metrics/lane{lane_id}_mae']:.3f}, "
+                f"Acc@1={stats[f'metrics/lane{lane_id}_acc_valid_tol1']:.4f}, "
+                f"Acc@3={stats[f'metrics/lane{lane_id}_acc_valid_tol3']:.4f}, "
+                f"Acc@5={stats[f'metrics/lane{lane_id}_acc_valid_tol5']:.4f}, "
+                f"Exist={stats[f'metrics/lane{lane_id}_exist_acc']:.4f}"
+            )
 
     def get_desc(self):
         return ("%22s" + "%11s" * 6) % ("lane", "mae", "mae_px", "acc@1", "acc@3", "acc@5", "exist")

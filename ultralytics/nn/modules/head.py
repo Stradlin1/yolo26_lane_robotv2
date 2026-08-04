@@ -1898,3 +1898,112 @@ class LaneRobotV2(nn.Module):
         if self.export:
             return torch.cat((cls, offset), dim=1)
         return {"cls": cls, "offset": offset}
+
+
+class LaneRobotV3B(nn.Module):
+    """Row-anchor lane head with per-lane classifiers shared across row anchors.
+
+    Plan-B head for the LaneRobot V3 redesign:
+        Conv1x1 (reduce channels)
+        -> fixed bilinear row sampling (bottom-to-top row anchors, grouped conv)
+        -> per-row flatten + row-mean concat
+        -> shared projection 464->hidden_dim + ReLU
+        -> shared row embedding
+        -> 4 per-lane classifiers (hidden_dim -> x_grids+1), each shared across rows
+        -> 4 per-lane offset heads (hidden_dim -> 1)
+
+    Keeps the exact V2 output protocol:
+        {"cls": [B, x_grids+1, row_anchors, num_lanes],
+         "offset": [B, 1, row_anchors, num_lanes]}
+    """
+
+    export = False
+
+    def __init__(
+        self,
+        x_grids: int = 320,
+        row_anchors: int = 56,
+        num_lanes: int = 4,
+        reduce_channels: int = 16,
+        hidden_dim: int = 512,
+        feat_h: int = 16,
+        feat_w: int = 28,
+        y_start: float = 0.333333,
+        y_end: float = 1.0,
+        ch: tuple = (),
+    ):
+        super().__init__()
+        c1 = ch[0] if isinstance(ch, (tuple, list)) else int(ch)
+        self.x_grids = int(x_grids)
+        self.row_anchors = int(row_anchors)
+        self.num_lanes = int(num_lanes)
+        self.reduce_channels = int(reduce_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.feat_h = int(feat_h)
+        self.feat_w = int(feat_w)
+        self.y_start = float(y_start)
+        self.y_end = float(y_end)
+        self.no_lane_idx = self.x_grids
+        self.out_shape = (self.x_grids + 1, self.row_anchors, self.num_lanes)
+
+        self.conv_1x1 = nn.Conv2d(c1, self.reduce_channels, kernel_size=1, stride=1, padding=0, bias=True)
+        self._build_row_sampler(self.feat_h)
+
+        row_dim = self.reduce_channels * self.feat_w + self.reduce_channels  # columns + row mean
+        self.proj = nn.Linear(row_dim, self.hidden_dim)
+        self.act = nn.ReLU(inplace=False)
+        self.row_embed = nn.Parameter(torch.zeros(self.row_anchors, self.hidden_dim))
+        self.cls_heads = nn.ModuleList(nn.Linear(self.hidden_dim, self.x_grids + 1) for _ in range(self.num_lanes))
+        self.offset_heads = nn.ModuleList(nn.Linear(self.hidden_dim, 1) for _ in range(self.num_lanes))
+        for layer in (self.proj, *self.cls_heads, *self.offset_heads):
+            linear_init(layer)
+
+    def _build_row_sampler(self, feat_h: int) -> None:
+        """Build the fixed bilinear bottom-to-top row-sampling matrix and its grouped-conv form."""
+        h = int(feat_h)
+        r = self.row_anchors
+        # Anchor rows are stored bottom-to-top: r=0 -> y_end (image bottom), r=R-1 -> y_start.
+        y = torch.linspace(self.y_end, self.y_start, r, dtype=torch.float32)
+        p = y * (h - 1)
+        i0 = torch.clamp(torch.floor(p).long(), 0, h - 1)
+        i1 = torch.clamp(i0 + 1, 0, h - 1)
+        w1 = (p - i0.float()).clamp(0.0, 1.0)
+        w0 = 1.0 - w1
+        matrix = torch.zeros(r, h, dtype=torch.float32)
+        matrix.scatter_(1, i0.unsqueeze(1), w0.unsqueeze(1))
+        matrix.scatter_add_(1, i1.unsqueeze(1), w1.unsqueeze(1))
+        self.register_buffer("row_mix", matrix)
+        # Grouped-conv view: one shared [R, feat_h] matrix per input channel.
+        conv_w = matrix.unsqueeze(1).unsqueeze(-1).repeat(self.reduce_channels, 1, 1, 1)
+        self.register_buffer("row_conv_w", conv_w)
+
+    def _sample_rows(self, x: torch.Tensor) -> torch.Tensor:
+        """Sample one feature vector per anchor row from a [B,C,H,W] tensor."""
+        b, c, h, w = x.shape
+        x = F.conv2d(x, self.row_conv_w, groups=c)  # [B, C*R, 1, W]
+        return x.view(b, c, self.row_anchors, w)
+
+    def forward(self, x):
+        """Forward through the V3-B head, returning the V2-compatible cls/offset dict."""
+        x = self.conv_1x1(x)
+        if x.shape[-2:] != (self.feat_h, self.feat_w):
+            # Fallback for non-canonical input sizes; train/export with a fixed imgsz for parity.
+            x = F.adaptive_avg_pool2d(x, (self.feat_h, self.feat_w))
+
+        xs = self._sample_rows(x)  # [B, C, R, W]
+        b, c, r, w = xs.shape
+        row_feat = xs.permute(0, 2, 1, 3).reshape(b, r, c * w)  # [B, R, C*W]
+        row_mean = xs.mean(dim=-1).permute(0, 2, 1)  # [B, R, C]
+        row_feat = torch.cat((row_feat, row_mean), dim=-1)  # [B, R, C*W + C]
+
+        z = self.act(self.proj(row_feat))  # [B, R, hidden_dim]
+        z = z + self.row_embed.unsqueeze(0)
+
+        cls = torch.stack([head(z) for head in self.cls_heads], dim=2)  # [B, R, L, X+1]
+        offset = torch.stack([head(z) for head in self.offset_heads], dim=2)  # [B, R, L, 1]
+        cls = cls.permute(0, 3, 1, 2).contiguous()  # [B, X+1, R, L]
+        offset = torch.tanh(offset).permute(0, 3, 1, 2).contiguous() * 0.5  # [B, 1, R, L]
+
+        if self.export:
+            return torch.cat((cls, offset), dim=1)
+        return {"cls": cls, "offset": offset}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from copy import copy, deepcopy
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,8 @@ class LaneRobotTrainer(BaseTrainer):
 
     def get_dataset(self):
         data = YAML.load(self.args.data) if isinstance(self.args.data, (str, Path)) else dict(self.args.data)
-        root = Path(data.get("path", ".")).expanduser()
+        # LANE_ROBOT_DATASETS overrides the YAML path so checkouts don't need editing.
+        root = Path(os.environ.get("LANE_ROBOT_DATASETS", data.get("path", "."))).expanduser()
         for k in ("train", "val", "test"):
             if data.get(k) and not Path(data[k]).is_absolute():
                 data[k] = str(root / data[k])
