@@ -1,16 +1,22 @@
-# YOLO26 Lane Robot V2 — 固定语义多线检测
+# YOLO26 Lane Robot — 固定语义多线检测
 
-基于 Ultralytics YOLO26 与 UFLD/Row-Anchor 思路改造的机器人前视多线检测工程。
+基于 Ultralytics YOLO26 与 UFLD / Row-Anchor 思路改造的机器人前视多线检测工程。
 
-> 更新日期：2026-08-03  
-> 当前稳定方案：四个固定语义槽位、每个槽位最多一条曲线  
-> 当前部署目标：RDK X5 / OpenExplorer / NV12 Runtime
+> 更新日期：2026-08-04  
+> 当前开发分支：`zbn`  
+> 当前训练方案：`LaneRobotV3B`，输入 `256×448`  
+> 已验证部署基线：`LaneRobotV2`，输入 `320×320`，RDK X5 BPU + CPU 混合执行
 
-本项目已将原始单线 Lane Robot 改造成四槽位多线检测系统，训练、验证、PyTorch 推理、ONNX 导出与 ONNX Runtime 推理主链路已经跑通。RDK X5 Runtime BIN 已成功生成，但当前分类输出层仍因 BPU 维度限制回退到 CPU，属于 BPU + CPU 混合执行模型。
+本项目将原始单线 Lane Robot 改造成四个固定语义槽位的多线检测系统。`zbn` 分支新增了 V3-B Row-Anchor Head、独立训练入口、逐槽位验证指标和可移植的数据集路径配置。
+
+需要明确区分：
+
+- **V2**：训练、验证、PyTorch 推理、ONNX 导出、ONNX Runtime 推理和 RDK X5 Runtime BIN 已跑通，是当前部署基线。
+- **V3B**：模型结构和训练管线已经接入代码，输出协议保持兼容；正式训练结果、ONNX 导出和 RDK X5 量化仍需重新验证。
 
 ---
 
-## 1. 模型解决什么问题
+## 1. 任务定义
 
 模型直接从机器人前视 RGB 图像中识别四种固定语义线，不依赖 BEV：
 
@@ -28,9 +34,9 @@
 支持：
 
 - 每张图存在 0～4 条线。
-- 某个槽位整张图缺失。
+- 某个语义槽位整张图缺失。
 - 某条线仅局部可见。
-- 用 `x=-1` 标记遮挡、断点或当前 Row Anchor 无有效点。
+- 使用 `x=-1` 标记遮挡、断点或当前 Row Anchor 无有效点。
 - 四槽位联合训练、验证、解码、可视化和标签导出。
 
 暂不支持：
@@ -38,90 +44,153 @@
 - 同一张图中出现两条相同语义线，例如两条 `channel_left`。
 - 任意数量的未知曲线实例。
 - Hungarian matching 或动态实例分配。
-- 已完成闭环验证的 Polyline 实例头。
+- 已完成训练、导出和部署闭环的 Polyline 实例头。
 
 ---
 
 ## 2. 当前工程状态
 
-| 模块 | 状态 | 说明 |
+| 模块 | V2 | V3B / `zbn` |
 |---|---|---|
-| 单线改四槽位 | 已完成 | Dataset、Head、Loss、Predictor 均支持四槽位 |
-| 标签读取 | 已验证 | 目标张量形状为 `[B, 56, 4]` |
-| 模型前向与反向 | 已验证 | 六项损失可计算并完成反向传播 |
-| Trainer / Validator | 已验证 | 可训练、验证并保存 `best.pt` / `last.pt` |
-| PyTorch Predictor | 已接通 | 可解码、绘图和保存预测 txt |
-| ONNX 导出 | 已完成 | Opset 11，当前合并输出 `[B, 322, 56, 4]` |
-| ONNX Runtime 推理 | 已完成 | 支持 CPU/CUDA Provider、Resize/LetterBox |
-| RDK X5 Runtime BIN | 已生成 | NV12 输入，当前为 BPU + CPU 混合执行 |
-| 逐槽位指标 | 待完成 | 当前总体指标可能掩盖单槽位失败 |
-| 严格断点绘制 | 待修正 | 当前 ONNX 绘图仍可能跨缺失 Anchor 连线 |
-| Polyline head | 实验阶段 | 尚未完成训练、导出和部署闭环 |
+| 四槽位 Dataset / Loss | 已验证 | 复用并修正 offset / soft-label 目标 |
+| 模型前向与反向 | 已验证 | 代码已接入，需正式训练验证 |
+| Trainer | 已验证 | 新增 `train_v3b.py` |
+| Validator | 仅总体指标 | 已增加逐槽位指标 |
+| PyTorch Predictor | 已接通 | 输出协议相同，需端到端复测 |
+| ONNX 导出 | 已完成，`320×320` | 尚未完成 V3B `256×448` 闭环 |
+| ONNX Runtime 推理 | 已完成 | 尚未复测 |
+| RDK X5 Runtime BIN | 已生成，混合执行 | 尚未量化 |
+| 数据集路径 | YAML 中固定路径 | 支持 `LANE_ROBOT_DATASETS` 覆盖 |
+| 严格断点绘制 | 仍需注意 | 仍需注意 |
 
 ---
 
-## 3. 稳定模型结构
+## 3. V3B 新模型结构
+
+V3B 保留 V2 的 YOLO26 Backbone 和 P4 + P5 融合部分，替换最终 Lane Head。
 
 ```text
-输入图像
-  ↓
-Direct Resize 或自定义 LetterBox
+输入 RGB 图像 [B, 3, 256, 448]
   ↓
 YOLO26 Backbone
   ↓
-P4 + P5 多尺度特征融合
+P4 + P5 多尺度融合，stride = 16
   ↓
-LaneRobotV2 Head
-  ├── cls:    [B, X+1, R, L]
-  └── offset: [B, 1,   R, L]
+融合特征 [B, 256, 16, 28]
   ↓
-Top-K soft-argmax + offset
+Conv1x1: 256 → 16
   ↓
-固定四槽位曲线坐标
+固定双线性 Row Sampling：56 个纵向锚点
+  ↓
+每行特征：16×28 展平 + 16 维行均值 = 464
+  ↓
+共享投影：464 → 512 + ReLU
+  ↓
+加可学习 Row Embedding
+  ↓
+4 个 lane-specific 分类器：512 → 321
+4 个 lane-specific offset 回归器：512 → 1
+  ↓
+cls    [B, 321, 56, 4]
+offset [B,   1, 56, 4]
 ```
 
-当前部署配置：
+V3B 的关键变化：
+
+- 使用固定双线性采样，将特征图映射到 56 个 Row Anchors。
+- 分类器参数在 56 个 Row Anchors 之间共享。
+- 四个语义槽位使用独立分类器和 offset 回归器。
+- 使用可学习 Row Embedding 保留不同纵向位置的信息。
+- offset 经 `tanh` 限制到 `[-0.5, 0.5]`。
+- 不再使用 V2 中一次性输出 `321×56×4` 的单个大分类 Linear。
+
+模型 YAML：
 
 ```text
-X = x_grids    = 320
+ultralytics/cfg/models/26/yolo26s-lane-v3b.yaml
+```
+
+核心配置：
+
+```yaml
+x_grids: 320
+row_anchors: 56
+num_lanes: 4
+reduce_channels: 16
+hidden_dim: 512
+feat_h: 16
+feat_w: 28
+y_start: 0.333333
+y_end: 1.0
+```
+
+目标输入为：
+
+```text
+height = 256
+width  = 448
+aspect = 1.75
+```
+
+宽高都能被 32 整除，比例接近原始 16:9 相机画面。
+
+---
+
+## 4. 输出协议
+
+V2 与 V3B 的 PyTorch 输出协议保持一致：
+
+```text
+cls:    [B, X+1, R, L]
+offset: [B, 1,   R, L]
+```
+
+当前配置：
+
+```text
+X = x_grids     = 320
 R = row_anchors = 56
 L = num_lanes   = 4
 ```
 
-PyTorch Head 输出：
+因此：
 
 ```text
 cls:    [B, 321, 56, 4]
 offset: [B,   1, 56, 4]
 ```
 
-ONNX 合并输出：
+分类通道定义：
 
 ```text
-lane_output: [B, 322, 56, 4]
+0..319 : 320 个横向网格位置
+320    : no-lane 类别
 ```
 
-通道定义：
-
-```text
-0..319  : 320 个横向网格 logits
-320     : no-lane logit
-321     : 亚网格 offset
-```
-
-模型没有独立 confidence Head。点存在概率来自：
+点存在概率来自：
 
 ```text
 existence = 1 - P(no-lane)
 ```
 
----
+连续横向坐标由局部 Top-K soft-argmax 与 offset 共同得到。
 
-## 4. 仓库关键文件
+V2 现有 ONNX 导出脚本会把两部分合并成：
 
 ```text
-train_xhm.py                         正式训练入口
-export_onnx_xhm.py                   PT → ONNX Opset 11
+lane_output [B, 322, 56, 4]
+```
+
+V3B 虽然保持相同逻辑输出，但必须重新验证导出脚本对 `256×448` 输入和 V3B Head 的兼容性，不能直接把 V2 的部署结论套用到 V3B。
+
+---
+
+## 5. 仓库关键文件
+
+```text
+train_v3b.py                         V3B 正式训练入口
+train_xhm.py                         V2 训练入口
+export_onnx_xhm.py                   V2 PT → ONNX Opset 11 基线
 infer_onnx_xhm.py                    ONNX Runtime 图片推理
 check_empty_labels.py                空标签检查
 
@@ -129,7 +198,8 @@ ultralytics/cfg/datasets/
 └── lane-robot.yaml                  数据路径、槽位和预处理配置
 
 ultralytics/cfg/models/26/
-├── yolo26n-lane.yaml
+├── yolo26s-lane-v3b.yaml            V3B 模型配置
+├── yolo26n-lane.yaml                V2 配置
 ├── yolo26s-lane.yaml
 ├── yolo26m-lane.yaml
 └── yolo26x-lane.yaml
@@ -142,24 +212,21 @@ ultralytics/models/yolo/lane/
 ├── predict.py
 └── plotting.py
 
+ultralytics/nn/modules/head.py        LaneRobot / V2 / V3B Head
+ultralytics/utils/loss.py             LaneRobot 六项损失
+
 Lane_Robot_RDK_X5_quantization_issues_and_solutions_2026-08-03.md
 ```
 
-RDK X5 的完整量化记录、YAML 配置、错误分析和拆 Head 方案见：
+RDK X5 的 V2 量化记录、YAML 配置、错误分析和拆 Head 思路见：
 
 [Lane Robot RDK X5 量化问题与解决思路](Lane_Robot_RDK_X5_quantization_issues_and_solutions_2026-08-03.md)
 
 ---
 
-## 5. 数据集结构
+## 6. 数据集结构
 
-默认本地项目路径：
-
-```text
-/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT
-```
-
-数据目录：
+默认目录结构：
 
 ```text
 datasets/
@@ -178,7 +245,7 @@ datasets/images/train/abc.jpg
 datasets/labels_corrected/train/abc.txt
 ```
 
-当前 `ultralytics/cfg/datasets/lane-robot.yaml` 已显式配置：
+`ultralytics/cfg/datasets/lane-robot.yaml`：
 
 ```yaml
 path: /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/datasets
@@ -209,17 +276,26 @@ flip_lane_pairs:
   - [2, 3]
 ```
 
-`num_lanes` 决定 Lane Head 的固定槽位数量；`x_grids` 决定横向分类网格数量。模型 YAML 中可能存在用于框架兼容的 `nc` 字段，判断实际 Lane 输出时应查看：
+### 6.1 使用环境变量覆盖数据集根目录
 
-```text
-LaneRobotV2 [320, 56, 4, ...]
+`zbn` 分支支持：
+
+```bash
+export LANE_ROBOT_DATASETS=/absolute/path/to/datasets
 ```
 
-以及实际输出形状，而不是只看某一个 YAML 字段。
+Trainer 和显式标签路径会优先使用该环境变量，不需要在不同机器上反复修改 YAML 中的 `path`。
+
+例如：
+
+```bash
+export LANE_ROBOT_DATASETS=/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/datasets
+python train_v3b.py --weights runs/lane/lane_n_baseline/weights/last.pt
+```
 
 ---
 
-## 6. 标签格式
+## 7. 标签格式
 
 每一行表示一个固定语义槽位：
 
@@ -243,7 +319,7 @@ lane_id x1 y1 x2 y2 ... x56 y56
 - `x=-1` 表示该 Row Anchor 没有有效点。
 - `y` 为归一化纵坐标。
 - 某条线整张图不存在时，可省略该 `lane_id` 行。
-- 某条线中间被遮挡时，遮挡区对应 Anchor 的 `x` 写成 `-1`，前后可见部分继续保留坐标。
+- 某条线中间被遮挡时，遮挡区对应 Anchor 的 `x` 写为 `-1`，前后可见部分继续保留坐标。
 
 例如一张图只有左右通道边界：
 
@@ -252,39 +328,17 @@ lane_id x1 y1 x2 y2 ... x56 y56
 3 x1 y1 x2 y2 ... x56 y56
 ```
 
-56 个纵向锚点顺序为：
+56 个纵向锚点按以下顺序保存：
 
 ```text
 1.000000 → 0.333333
 ```
 
-即从图像底部向上。默认 Anchor 生成必须使用：
+即从图像底部向上。默认锚点生成应使用：
 
 ```python
 np.linspace(y_end, y_start, row_anchors)
 ```
-
----
-
-## 7. 遮挡、断点与绘制现状
-
-训练标签可以通过 `x=-1` 表达真实断点。解码时，no-lane 概率超过阈值的点也会被恢复为 `-1`。
-
-但当前 `infer_onnx_xhm.py` 的绘图逻辑会：
-
-1. 跳过无效 Anchor；
-2. 收集该槽位所有有效点；
-3. 对全部有效点调用一次 `cv2.polylines()`。
-
-因此，当一条线中间存在一段 `-1` 时，当前可视化仍可能把遮挡前后的两段跨空白连接起来。该问题属于绘图/后处理表达问题，不等于模型一定没有学到 no-lane。
-
-严格保留断点时，应采用以下任一方式：
-
-- 仅绘制点，不调用 `cv2.polylines()`；
-- 按连续有效 Anchor 分段，每段分别画折线；
-- 当相邻有效 Anchor 的索引差或像素距离超过阈值时强制断开。
-
-部署控制层也不应把跨越大段无效 Anchor 的点直接拟合成一条连续曲线。
 
 ---
 
@@ -296,102 +350,113 @@ cd /home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT
 pip install -e .
 ```
 
-确认导入的是当前仓库：
+确认 Python 导入的是当前仓库：
 
 ```bash
 python -c "import ultralytics; print(ultralytics.__file__)"
 ```
 
-输出路径应位于：
-
-```text
-/home/xhm/Desktop/ULTRALYTICS_LANE_ROBOT/ultralytics/
-```
-
 ---
 
-## 9. 训练
+## 9. V3B 训练
 
-### 9.1 当前 `train_xhm.py` 的真实默认值
+### 9.1 默认训练配置
 
-当前仓库脚本默认：
-
-```text
-model       = yolo26s-lane.yaml
-imgsz       = [256, 320]
-epochs      = 1000
-batch       = 8
-optimizer   = AdamW
-lr0         = 3e-4
-```
-
-并且 `AUGMENTATION_CONFIG` 当前不是“全关闭”：
+`train_v3b.py` 的主要默认值：
 
 ```text
-hsv_h    = 0.005
-hsv_s    = 0.15
-hsv_v    = 0.15
-degrees  = 2.0
-fliplr   = 0.3
+model        = yolo26s-lane-v3b.yaml
+imgsz        = [256, 448]
+epochs       = 500
+patience     = 100
+batch        = -1       # Ultralytics Autobatch
+workers      = 8
+optimizer    = AdamW
+lr0          = 3e-4
+lrf          = 0.01
+weight_decay = 0.01
+warmup       = 3 epochs
+cos_lr       = true
 ```
 
-其中水平翻转会通过：
+增强配置：
 
-```yaml
-flip_lane_pairs:
-  - [2, 3]
+```text
+hsv_h       = 0.002
+hsv_s       = 0.05
+hsv_v       = 0.05
+degrees     = 2.0
+translate   = 0.03
+scale       = 0.05
+fliplr      = 0.5
+flipud      = 0.0
+shear       = 0.0
+perspective = 0.0
+mosaic      = 0.0
+mixup       = 0.0
+cutmix      = 0.0
+copy_paste  = 0.0
+erasing     = 0.0
 ```
 
-同步交换 `channel_left` 和 `channel_right`。
+### 9.2 从 V2 权重迁移
 
-如果要建立严格无增强基线，需要先修改 `train_xhm.py` 中的 `AUGMENTATION_CONFIG`，将颜色和几何增强显式设为 0。当前脚本没有为每个增强项单独提供 CLI 参数。
-
-### 9.2 直接运行当前训练配置
+推荐命令：
 
 ```bash
-python train_xhm.py \
-  --name lane_s_current \
-  --epochs 1000 \
-  --patience 100 \
-  --batch 8
+python train_v3b.py \
+  --weights runs/lane/lane_n_baseline/weights/last.pt \
+  --name lane_v3b
 ```
 
-### 9.3 面向当前 320×320 ONNX / RDK 部署的训练
+V2 与 V3B 的 Backbone / Neck 保持相同，兼容层可迁移；V3B Head 结构不同，应从随机初始化开始训练。启动日志中应检查实际 transferred 参数数量，不能只根据命令假设 Head 已正确排除。
 
-当前 ONNX 导出和 RDK X5 量化基线使用静态 `320×320` 输入，因此建议训练时也明确指定：
+常用覆盖：
 
 ```bash
-python train_xhm.py \
-  --img-height 320 \
-  --img-width 320 \
-  --name lane_s_320 \
-  --epochs 1000 \
-  --patience 100 \
-  --batch 8
+python train_v3b.py \
+  --weights runs/lane/lane_n_baseline/weights/last.pt \
+  --epochs 300 \
+  --patience 60 \
+  --batch 16 \
+  --name lane_v3b_e300
 ```
 
-必须保持以下环节一致：
+### 9.3 从随机初始化训练
+
+```bash
+python train_v3b.py --name lane_v3b_scratch
+```
+
+### 9.4 中断后续训
+
+```bash
+python train_v3b.py \
+  --resume runs/lane/lane_v3b/weights/last.pt
+```
+
+`--resume` 与 `--weights` 不是同一用途：
+
+- `--weights`：创建新的 V3B 实验并迁移兼容权重。
+- `--resume`：恢复同一个已中断实验的模型、优化器和训练状态。
+
+### 9.5 启动后检查
+
+模型摘要中应看到：
 
 ```text
-训练预处理
-→ PyTorch 验证/推理
-→ ONNX 导出输入尺寸
-→ ONNX Runtime 预处理
-→ 量化校准预处理
-→ RDK 板端预处理
+LaneRobotV3B
 ```
 
-不要用 `256×320` 训练权重，在未验证自适应池化和坐标映射影响的情况下直接按 `320×320` 量化部署。
-
-### 9.4 训练日志检查
-
-训练启动后应确认：
+并确认：
 
 ```text
-LaneRobotV2 [320, 56, 4, ...]
+input  = [B, 3, 256, 448]
+cls    = [B, 321, 56, 4]
+offset = [B,   1, 56, 4]
 ```
 
-并看到六项损失：
+训练日志仍包含六项损失：
 
 ```text
 lane_ce
@@ -404,243 +469,95 @@ lane_offset
 
 ---
 
-## 10. 验证与 PyTorch 推理
+## 10. 损失函数修正
 
-验证：
-
-```bash
-yolo task=lane mode=val \
-  model=runs/lane/lane_s_320/weights/best.pt \
-  data=ultralytics/cfg/datasets/lane-robot.yaml \
-  imgsz=320 \
-  device=0
-```
-
-预测：
-
-```bash
-yolo task=lane mode=predict \
-  model=runs/lane/lane_s_320/weights/best.pt \
-  source=datasets/images/valid \
-  imgsz=320 \
-  device=0 \
-  save=True \
-  save_txt=True \
-  project=runs/lane \
-  name=predict_lane_s_320 \
-  exist_ok=True
-```
-
-当前 Validator 主要输出总体指标，例如：
+`zbn` 分支统一了 soft-label 分类中心和 offset 目标的整数基准：
 
 ```text
-MAE
-MAE_px
-Acc@1
-Acc@3
-Acc@5
-Exist
+base = round(target_x)
+offset_target = target_x - base
 ```
 
-后续应增加每个槽位独立的 MAE、Exist、漏检率和左右边界混淆统计。
+soft-label 高斯中心同样使用：
+
+```text
+round(target_x)
+```
+
+这样分类网格中心与 offset 残差使用相同基准，避免一个使用 floor、另一个使用 round 造成目标不一致。
 
 ---
 
-## 11. ONNX 导出
+## 11. 验证指标
 
-`export_onnx_xhm.py` 默认：
+总体指标仍包括：
 
 ```text
-input        = float32 [1, 3, 320, 320]
-output       = float32 [1, 322, 56, 4]
-opset        = 11
-static batch = 1
+metrics/lane_mae
+metrics/lane_mae_px
+metrics/lane_acc_valid_tol1
+metrics/lane_acc_valid_tol3
+metrics/lane_acc_valid_tol5
+metrics/lane_exist_acc
 ```
 
-导出并执行 ONNX Runtime 校验：
+`zbn` 分支新增每个槽位独立指标：
 
-```bash
-conda run -n lane_robot python export_onnx_xhm.py \
-  --weights runs/lane/lane_s_320/weights/best.pt \
-  --output runs/lane/lane_s_320/weights/best.onnx \
-  --imgsz 320 320 \
-  --verify-runtime
+```text
+metrics/lane0_mae
+metrics/lane0_acc_valid_tol1
+metrics/lane0_acc_valid_tol3
+metrics/lane0_acc_valid_tol5
+metrics/lane0_exist_acc
+
+...
+
+metrics/lane3_mae
+metrics/lane3_acc_valid_tol1
+metrics/lane3_acc_valid_tol3
+metrics/lane3_acc_valid_tol5
+metrics/lane3_exist_acc
 ```
 
-脚本默认要求 `x_grids=320`，用于防止误把旧的 160-grid 权重当成当前模型导出。只有明确处理旧模型时才使用：
+槽位对应关系：
 
-```bash
---allow-legacy-x-grids
+```text
+lane0 = lane_follow
+lane1 = lead_lane
+lane2 = channel_left
+lane3 = channel_right
 ```
+
+这些指标可以发现总体平均值掩盖的单槽位漏检、偏移或类别不平衡问题。
+
+当前仍建议后续补充：
+
+- 每槽位 False Positive / False Negative。
+- 左右边界交换率。
+- 按近端 / 远端 Row Anchor 分段的误差。
+- 按遮挡与非遮挡样本分组的指标。
 
 ---
 
-## 12. ONNX Runtime 推理
+## 12. 正式训练前的数据 EDA
 
-```bash
-conda run -n lane_robot python infer_onnx_xhm.py \
-  --model runs/lane/lane_s_320/weights/best.onnx \
-  --source test \
-  --output test_infer \
-  --save-txt \
-  --overwrite
-```
+在启用 V3B 默认 `fliplr=0.5` 前，至少完成以下检查：
 
-主要后处理参数：
+1. 每个槽位的图片级出现率。
+2. 每个槽位的有效 Anchor 数量和 `x` 分布。
+3. `lead_lane` 在水平翻转后是否仍保持同一语义。
+4. 远端 Row Anchors 的有效点密度。
+5. 标签叠加到原图后的可视化抽检。
+6. Train / Valid 是否存在同帧、近重复帧或时间序列泄漏。
+7. 空标签、坏图、NaN、非法行和重复 `lane_id`。
 
-```text
-exist_thr   = 0.5
-topk        = 5
-poly_degree = 2
-poly_blend  = 0.5
-offset clip = [-0.5, 0.5]
-```
-
-默认预处理：
-
-```text
-EXIF 修正
-→ RGB
-→ INTER_LINEAR 直接 Resize
-→ float32 / 255
-→ HWC 转 CHW
-→ 增加 Batch
-```
-
-只有使用 LetterBox 训练的权重才应在推理时添加：
-
-```bash
---letterbox
-```
-
-若出现：
-
-```text
-Failed to load library libonnxruntime_providers_cuda.so
-libcudnn.so.9: cannot open shared object file
-```
-
-说明 ONNX Runtime GPU 包与本机 CUDA/cuDNN 不匹配，不是模型输出结构错误。可先使用：
-
-```bash
---device cpu
-```
-
-验证模型和后处理。
+若某槽位的 no-lane 比例极高，应根据统计结果再决定是否需要调整 no-lane bias、采样策略或 loss 权重，不应直接凭经验修改。
 
 ---
 
-## 13. RDK X5 量化与部署状态
+## 13. 数据增强注意事项
 
-当前量化环境：
-
-```text
-OpenExplorer
-hb_mapper 1.24.3
-hbdk 3.49.15
-march = bayes-e
-Runtime input = NV12
-```
-
-已经确认的 ONNX 输入输出：
-
-```text
-images      [1, 3, 320, 320] float32 NCHW
-lane_output [1, 322, 56, 4] float32
-```
-
-量化训练输入语义：
-
-```yaml
-input_type_train: rgb
-input_layout_train: NCHW
-norm_type: data_scale
-scale_value: 0.003921568627451
-```
-
-NV12 Runtime 输入不能配置为普通 DDR 输入源。删除 `input_source` 让工具链自动推导，或显式配置为 pyramid。
-
-### 13.1 已解决
-
-- ONNX Opset 11 模型可被工具链读取。
-- NV12 Runtime 输入配置通过。
-- 注意力 Softmax 可通过 `node_info` 指定到 BPU。
-- Runtime BIN 已成功生成。
-- offset 分支可运行在 BPU INT8。
-
-### 13.2 当前核心限制
-
-分类层：
-
-```text
-/model/model.16/cls_fc2/Gemm
-```
-
-一次性输出：
-
-```text
-321 × 56 × 4 = 71904
-```
-
-当前 BPU 相关维度上限为：
-
-```text
-65536
-```
-
-因此：
-
-```text
-71904 > 65536
-```
-
-该大 `Gemm` 无法进入 BPU，只能回退到 CPU float。
-
-当前执行结构近似为：
-
-```text
-NV12 输入
-→ Backbone：BPU INT8
-→ Attention Softmax：BPU
-→ cls_fc2：CPU float
-→ offset_fc：BPU INT8
-→ Reshape / Concat：CPU
-→ lane_output [1, 322, 56, 4]
-```
-
-### 13.3 当前推荐路线
-
-第一阶段先使用混合模型完成：
-
-- 板端加载与输出检查。
-- C++ 后处理。
-- 精度对比。
-- `hb_perf` 和真实端到端 FPS 测试。
-- CPU 占用与 BPU/CPU 数据搬运开销测试。
-
-如果分类 Head 成为明显瓶颈，再把一个大 Linear 真正拆成两个：
-
-```text
-cls_fc2_01: 321 × 56 × 2 = 35952
-cls_fc2_23: 321 × 56 × 2 = 35952
-offset_fc : 1 × 56 × 4   = 224
-```
-
-推荐新 ONNX 输出：
-
-```text
-cls_01 [1, 321, 56, 2]
-cls_23 [1, 321, 56, 2]
-offset [1,   1, 56, 4]
-```
-
-只在旧大 `Gemm` 后增加 `Split` 无效，必须在 PyTorch Head 中创建两个较小的 Linear/Gemm，并正确迁移旧权重。
-
----
-
-## 14. 数据增强注意事项
-
-通道左右边界具有固定语义，几何增强必须同时变换：
+通道左右边界具有固定语义，几何增强必须同步处理：
 
 ```text
 图像
@@ -658,104 +575,158 @@ channel_left ↔ channel_right
 lane_id 2 ↔ lane_id 3
 ```
 
-Mosaic、MixUp、CutMix、Copy-Paste 会破坏连续通道结构，当前训练脚本保持关闭。
+当前 YAML 已配置：
 
-颜色对黄色通道与绿色背景具有语义，HSV 增强不应过强。正式实验应保存每次运行的完整参数，不要只依赖默认值。
-
----
-
-## 15. 正式训练前的数据检查
-
-至少检查：
-
-- 图片是否都有对应标签。
-- 标签是否都有对应图片。
-- `lane_id` 是否只在 `0～3`。
-- 同一文件是否重复出现同一 `lane_id`。
-- 每行是否正好包含 56 对坐标。
-- `x` 是否为 `-1` 或 `[0, 1]`。
-- 所有标签是否使用一致的 56 个 `y`。
-- Row Anchor 顺序是否为底部到上方。
-- 是否存在空文件、损坏图片、NaN 或非法文本。
-- 四个槽位的图片数和有效 Anchor 数是否严重失衡。
-
-代码能正常训练，不代表缺失槽位或极少样本槽位能被模型学会。
-
----
-
-## 16. 当前已知配置风险
-
-1. `train_xhm.py` 当前默认输入为 `256×320`，而 ONNX/RDK 基线为 `320×320`。
-2. `train_xhm.py` 当前启用了轻微 HSV、旋转和水平翻转，并非无增强基线。
-3. `infer_onnx_xhm.py` 的默认权重路径仍指向特定历史实验目录，正式使用应显式传 `--model`。
-4. 当前 ONNX 绘图会把同一槽位所有有效点一次性连成折线，可能跨遮挡区连接。
-5. 当前 RDK BIN 不是全 BPU 模型，分类大 `Gemm` 位于 CPU。
-6. 当前总体验证指标不足以确认每个固定语义槽位都学会。
-
----
-
-## 17. 下一步工作顺序
-
-### P0：冻结可复现基线
-
-- 固定输入尺寸和预处理策略。
-- 固定数据划分和随机种子。
-- 保存完整训练参数、代码提交、日志与权重。
-
-### P1：数据质量与逐槽位统计
-
-- 全量标签检查。
-- 统计四槽位样本数和有效点数。
-- 可视化训练输入经过增强后的真实标签。
-
-### P2：增加逐槽位指标
-
-至少增加：
-
-```text
-lane_follow/MAE
-lead_lane/MAE
-channel_left/MAE
-channel_right/MAE
-
-每槽位 Exist / Miss / False Positive
-左右边界混淆率
+```yaml
+flip_lane_pairs:
+  - [2, 3]
 ```
 
-### P3：修正断点绘制与控制输入
+但 `lane_follow` 和 `lead_lane` 是否允许保持原槽位，必须由真实任务语义和 EDA 结果确认。
 
-- 推理可视化改为点模式或连续段模式。
-- 控制层禁止跨大段 no-lane 拟合。
-- 对遮挡前后段分别评估稳定性。
-
-### P4：RDK 板端实测
-
-- 完成 C++ Softmax、Top-K soft-argmax、offset 和坐标恢复。
-- 测试 Runtime BIN 的精度、FPS、CPU 和 BPU 占用。
-- 再决定是否拆分分类 Head。
-
-### P5：实验 Polyline Head
-
-在相同数据和预处理条件下，对比：
-
-- 当前 Row-Anchor Head。
-- Row-Anchor + 分段后处理。
-- Polyline Head。
-
-重点比较转角、横向边界、遮挡断点、量化损失和端侧延迟。
+Mosaic、MixUp、CutMix、Copy-Paste 和随机擦除会破坏连续车道结构，V3B 训练脚本保持关闭。
 
 ---
 
-## 18. 检测输出到机器人控制
+## 14. 遮挡、断点与绘制
 
-模型只负责输出语义线坐标。控制层建议独立实现：
+训练标签可以通过 `x=-1` 表达真实断点，解码时 no-lane 概率超过阈值的点也会恢复为 `-1`。
+
+绘制和控制层必须避免把遮挡前后的有效点强制连接。可采用：
+
+- 仅绘制点。
+- 按连续有效 Anchor 分段绘制折线。
+- 相邻有效 Anchor 的索引差或像素距离超过阈值时强制断开。
+
+控制层不应把跨越大段无效 Anchor 的点直接拟合为一条连续曲线。
+
+---
+
+## 15. V2 ONNX 与 RDK X5 部署基线
+
+以下内容仍对应 **V2 320×320 模型**，不代表 V3B 已完成部署验证。
+
+现有 V2 ONNX：
+
+```text
+input  images      [1, 3, 320, 320] float32 NCHW
+output lane_output [1, 322, 56, 4] float32
+opset  11
+```
+
+现有 RDK X5 量化环境：
+
+```text
+OpenExplorer
+hb_mapper 1.24.3
+hbdk 3.49.15
+march = bayes-e
+Runtime input = NV12
+```
+
+V2 已生成 Runtime BIN，但分类层：
+
+```text
+/model/model.16/cls_fc2/Gemm
+```
+
+一次性输出：
+
+```text
+321 × 56 × 4 = 71904
+```
+
+超过当前 BPU 相关维度限制 `65536`，因此分类 Head 回退到 CPU float，形成 BPU + CPU 混合执行。
+
+V3B 已将分类器拆为四个 lane-specific Linear，每个分类器单次输出：
+
+```text
+321 × 56 = 17976
+```
+
+从结构上规避了 V2 单个 `71904` 大 Gemm，但能否完整进入 RDK X5 BPU 仍需重新导出 ONNX、量化并查看工具链节点分配，README 不预先宣称全 BPU。
+
+---
+
+## 16. V3B 导出与部署待办
+
+在 V3B 正式部署前，需要依次完成：
+
+1. 使用固定输入 `256×448` 完成 PyTorch 前向和验证。
+2. 更新或确认 `export_onnx_xhm.py` 支持非方形输入。
+3. 比较 PyTorch 与 ONNX Runtime 的 `cls`、`offset` 和最终解码坐标。
+4. 确认 ONNX 输入输出 shape。
+5. 用与训练一致的 direct resize / RGB / `/255` 预处理重新生成校准数据。
+6. 在 OpenExplorer 中检查四个分类 Gemm、offset Gemm、Row Sampling 和 Softmax 的节点分配。
+7. 完成板端 C++ Softmax、Top-K soft-argmax、offset 和坐标恢复。
+8. 对比 V2、V3B FP32、V3B ONNX 与 V3B INT8 的逐槽位误差。
+9. 测试端到端 FPS、CPU 占用、BPU 占用和数据搬运开销。
+
+训练、导出、量化校准和板端预处理必须统一为：
+
+```text
+256×448
+Direct Resize（当前 lane-robot.yaml 中 letterbox=false）
+RGB
+float32 / 255
+```
+
+---
+
+## 17. 已知风险
+
+1. V3B 代码已接入，但分支中尚无正式训练结果，不能仅凭前向 shape 判断精度。
+2. `fliplr=0.5` 依赖槽位语义正确交换，尤其要验证 `lead_lane` 的翻转语义。
+3. V2 权重迁移必须检查实际 transferred 参数，避免误加载或漏加载。
+4. V3B 输入从 V2 的 `320×320` 改为 `256×448`，旧 ONNX、量化校准数据和板端坐标恢复不能直接复用。
+5. 当前逐槽位指标仍未包含近端 / 远端分段、左右混淆和遮挡分组统计。
+6. 断点信息可能在不正确的绘图或控制拟合中被重新连接。
+7. `LANE_ROBOT_DATASETS` 只覆盖数据集根目录，模型、权重和输出路径仍由各自 CLI 参数控制。
+8. V3B 小 Gemm 是否全部落在 BPU 取决于实际 ONNX 图和工具链约束，必须以量化日志和 `hb_perf` 为准。
+
+---
+
+## 18. 建议工作顺序
+
+### P0：数据 EDA
+
+- 逐槽位出现率与有效 Anchor 数。
+- `lead_lane` 翻转语义检查。
+- 远端密度和标签叠图。
+- Train / Valid 泄漏检查。
+
+### P1：V3B 训练冒烟测试
+
+- 单 batch 前向、六项损失和 backward。
+- 1 个 epoch Trainer / Validator。
+- 检查逐槽位指标是否写入结果文件。
+
+### P2：正式 V3B 基线
+
+- 固定数据划分、随机种子、输入和增强。
+- 保存完整配置、提交 SHA、日志和权重。
+- 与 V2 使用相同验证集对比。
+
+### P3：V3B ONNX
+
+- 支持 `256×448` 静态输入。
+- PyTorch / ONNX 数值等价验证。
+- 推理可视化和 txt 输出复测。
+
+### P4：RDK X5 量化
+
+- 重建校准集。
+- 检查四个分类 Linear 的 BPU 分配。
+- 测试精度、FPS、CPU / BPU 占用。
+
+### P5：控制闭环
 
 ```text
 线检测
 → 选择目标线或计算通道中心
 → 横向误差与航向误差
 → 时序滤波与异常检测
-→ 速度/转角控制器
+→ 速度 / 转角控制器
 ```
 
 不应把单帧、未滤波、可能存在断点的预测坐标直接映射为电机命令。
