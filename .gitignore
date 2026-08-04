@@ -3,6 +3,7 @@
 /scripts/
 /test/
 /test_infer/
+/test_infer_v3b/
 *.zip
 __pycache__/
 *.py[cod]
