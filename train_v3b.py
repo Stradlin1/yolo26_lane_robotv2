@@ -12,6 +12,10 @@
 
 常用覆盖：
     python train_v3b.py --weights <v2.pt> --epochs 300 --patience 60 --batch 16
+
+冒烟测试（本地快速验证管线）：
+    python train_v3b.py --weights <v2.pt> --fraction 0.02 --epochs 1 --batch 4 \
+        --workers 2 --device cpu
 """
 
 from __future__ import annotations
@@ -76,8 +80,20 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Stop after this many epochs without fitness improvement; 0 disables early stopping.",
     )
-    parser.add_argument("--batch", type=int, default=-1, help="Batch size; -1 auto-selects the largest safe batch.")
+    parser.add_argument(
+        "--batch",
+        type=float,
+        default=-1,
+        help="Batch size: -1 auto-selects largest safe batch; 0<batch<=1 uses a GPU-memory fraction.",
+    )
     parser.add_argument("--workers", type=int, default=8, help="DataLoader worker processes.")
+    parser.add_argument("--fraction", type=float, default=1.0, help="Fraction of the training set to use (smoke tests).")
+    parser.add_argument(
+        "--freeze",
+        type=str,
+        default=None,
+        help="Freeze first N layers (int) or specific layer indices (comma list, e.g. '0,1,2').",
+    )
     parser.add_argument("--device", default="0", help="CUDA device, e.g. 0, 0,1, or cpu.")
     parser.add_argument("--img-height", type=int, default=256, help="Input image height.")
     parser.add_argument("--img-width", type=int, default=448, help="Input image width.")
@@ -87,6 +103,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lrf", type=float, default=0.01, help="Final LR fraction: final_lr = lr0*lrf.")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-epochs", type=float, default=3.0)
+
+    # LaneRobot loss / decode hyperparameters (defaults mirror ultralytics/cfg/default.yaml).
+    parser.add_argument("--lane-ce", type=float, default=1.0, help="Row-anchor x-class CE loss gain.")
+    parser.add_argument("--lane-loc", type=float, default=2.0, help="Expected-x SmoothL1 loss gain.")
+    parser.add_argument("--lane-exist", type=float, default=1.5, help="Lane-existence BCE loss gain.")
+    parser.add_argument("--lane-smooth", type=float, default=0.03, help="Adjacent-row smoothness loss gain.")
+    parser.add_argument("--lane-curv", type=float, default=0.02, help="Second-order curvature loss gain.")
+    parser.add_argument("--lane-offset", type=float, default=3.0, help="Sub-grid offset SmoothL1 loss gain.")
+    parser.add_argument("--lane-soft-sigma", type=float, default=1.0, help="Gaussian sigma for soft-label CE.")
+    parser.add_argument("--lane-softargmax-topk", type=int, default=5, help="Top-k window for soft-argmax.")
+    parser.add_argument("--lane-exist-thr", type=float, default=0.5, help="No-lane probability threshold.")
+    parser.add_argument("--lane-end-weight", type=float, default=3.0, help="Extra weight for end-segment rows (r25-34).")
 
     parser.add_argument("--save-period", type=int, default=100, help="Save checkpoint every N epochs; -1 disables.")
     parser.add_argument("--seed", type=int, default=42)
@@ -101,10 +129,20 @@ def parse_args() -> argparse.Namespace:
         parser.error("--epochs must be greater than 0")
     if args.patience < 0:
         parser.error("--patience must be 0 or greater")
-    if args.batch == 0:
-        parser.error("--batch must be -1 (auto) or a positive integer")
+    if args.batch != -1 and args.batch <= 0:
+        parser.error("--batch must be -1 (auto) or a positive value (<=1 means a GPU-memory fraction)")
     if args.img_height <= 0 or args.img_width <= 0:
         parser.error("image dimensions must be greater than 0")
+    if not (0.0 < args.fraction <= 1.0):
+        parser.error("--fraction must be in (0, 1]")
+    if args.lane_softargmax_topk < 1:
+        parser.error("--lane-softargmax-topk must be >= 1")
+
+    if args.freeze is not None:
+        try:
+            args.freeze = [int(x) for x in args.freeze.split(",")]
+        except ValueError:
+            parser.error("--freeze must be an int or a comma-separated list of ints")
 
     return args
 
@@ -153,6 +191,8 @@ def main() -> None:
         "lrf": args.lrf,
         "weight_decay": args.weight_decay,
         "warmup_epochs": args.warmup_epochs,
+        "fraction": args.fraction,
+        "freeze": args.freeze,
         "cos_lr": True,
         "amp": not args.no_amp,
         "seed": args.seed,
@@ -166,6 +206,16 @@ def main() -> None:
         "name": args.name,
         "exist_ok": args.exist_ok,
         "resume": resume_value,
+        "lane_ce": args.lane_ce,
+        "lane_loc": args.lane_loc,
+        "lane_exist": args.lane_exist,
+        "lane_smooth": args.lane_smooth,
+        "lane_curv": args.lane_curv,
+        "lane_offset": args.lane_offset,
+        "lane_soft_sigma": args.lane_soft_sigma,
+        "lane_softargmax_topk": args.lane_softargmax_topk,
+        "lane_exist_thr": args.lane_exist_thr,
+        "lane_end_weight": args.lane_end_weight,
         **AUGMENTATION_CONFIG,
     }
 
@@ -177,9 +227,17 @@ def main() -> None:
     print(f"output       : {project_path / args.name}")
     print(f"epochs       : {args.epochs}")
     print(f"patience     : {args.patience} (0 means disabled)")
-    print(f"batch        : {args.batch} (-1 = autobatch)")
+    print(f"batch        : {args.batch} (-1 = autobatch, <=1 = memory fraction)")
+    print(f"fraction     : {args.fraction} (smoke tests use e.g. 0.02)")
+    print(f"freeze       : {args.freeze}")
     print(f"imgsz        : [{args.img_height}, {args.img_width}]")
     print(f"device       : {args.device}")
+    print(
+        "lane loss    : "
+        f"ce={args.lane_ce}, loc={args.lane_loc}, exist={args.lane_exist}, "
+        f"smooth={args.lane_smooth}, curv={args.lane_curv}, offset={args.lane_offset}, "
+        f"end_weight={args.lane_end_weight}"
+    )
     print(
         "augmentation : "
         f"fliplr={AUGMENTATION_CONFIG['fliplr']}, "

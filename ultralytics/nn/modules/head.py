@@ -1905,7 +1905,7 @@ class LaneRobotV3B(nn.Module):
 
     Plan-B head for the LaneRobot V3 redesign:
         Conv1x1 (reduce channels)
-        -> fixed bilinear row sampling (bottom-to-top row anchors, grouped conv)
+        -> learnable bilinear-initialized row sampling (bottom-to-top row anchors, grouped conv)
         -> per-row flatten + row-mean concat
         -> shared projection 464->hidden_dim + ReLU
         -> shared row embedding
@@ -1959,7 +1959,7 @@ class LaneRobotV3B(nn.Module):
             linear_init(layer)
 
     def _build_row_sampler(self, feat_h: int) -> None:
-        """Build the fixed bilinear bottom-to-top row-sampling matrix and its grouped-conv form."""
+        """Build the bilinear-initialized learnable row-sampling matrix and its grouped-conv form."""
         h = int(feat_h)
         r = self.row_anchors
         # Anchor rows are stored bottom-to-top: r=0 -> y_end (image bottom), r=R-1 -> y_start.
@@ -1973,9 +1973,10 @@ class LaneRobotV3B(nn.Module):
         matrix.scatter_(1, i0.unsqueeze(1), w0.unsqueeze(1))
         matrix.scatter_add_(1, i1.unsqueeze(1), w1.unsqueeze(1))
         self.register_buffer("row_mix", matrix)
-        # Grouped-conv view: one shared [R, feat_h] matrix per input channel.
+        # Grouped-conv view: one [R, feat_h] matrix per input channel, initialized to bilinear.
+        # Learnable so the model can sharpen/reshaping the row sampling (esp. sparse far rows).
         conv_w = matrix.unsqueeze(1).unsqueeze(-1).repeat(self.reduce_channels, 1, 1, 1)
-        self.register_buffer("row_conv_w", conv_w)
+        self.row_conv_w = nn.Parameter(conv_w.clone())
 
     def _sample_rows(self, x: torch.Tensor) -> torch.Tensor:
         """Sample one feature vector per anchor row from a [B,C,H,W] tensor."""

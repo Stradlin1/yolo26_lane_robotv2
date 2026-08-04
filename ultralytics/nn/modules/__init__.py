@@ -63,6 +63,7 @@ from .block import (
 from .conv import (
     CBAM,
     ChannelAttention,
+    ChromaEdge,
     Concat,
     Conv,
     Conv2,
@@ -144,6 +145,7 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "ChannelAttention",
+    "ChromaEdge",
     "Classify",
     "Concat",
     "ContrastiveHead",

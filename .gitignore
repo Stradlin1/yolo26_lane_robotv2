@@ -5,6 +5,11 @@
 /test_infer/
 /test_infer_v3b/
 *.zip
+*.patch
+*.bundle
+*.onnx
+/previews/
+/docs/conclusions_2026-08-04.md
 __pycache__/
 *.py[cod]
 sem/*.pt

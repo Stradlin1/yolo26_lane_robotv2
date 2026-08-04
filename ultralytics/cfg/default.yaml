@@ -127,6 +127,9 @@ lane_curv: 0.02 # (float) second-order curvature regularization gain
 lane_soft_label: True # (bool) use Gaussian soft labels for visible x classes
 lane_soft_sigma: 1.0 # (float) Gaussian sigma in x-grid units for soft-label CE
 lane_softargmax_topk: 5 # (int) local top-k soft-argmax window for decoding and loc loss
+lane_end_row_start: 25 # (int) first row of the end-segment weighting band
+lane_end_row_end: 35 # (int) one past the last row of the end-segment weighting band
+lane_end_weight: 3.0 # (float) extra weight for CE/loc/offset on end-segment rows with valid points
 lane_exist_thr: 0.5 # (float) no-lane probability threshold; lower means stricter existence
 lane_post_smooth: True # (bool) apply polynomial smoothing in visualization/predict decoding
 lane_poly_degree: 2 # (int) polynomial degree for lane post-smoothing

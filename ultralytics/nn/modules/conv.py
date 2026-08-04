@@ -8,10 +8,12 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 __all__ = (
     "CBAM",
     "ChannelAttention",
+    "ChromaEdge",
     "Concat",
     "Conv",
     "Conv2",
@@ -25,6 +27,37 @@ __all__ = (
     "RepConv",
     "SpatialAttention",
 )
+
+
+class ChromaEdge(nn.Module):
+    """RGB -> [R, G, B, color-edge]: append a color-boundary prior computed in-graph.
+
+    Lane boundaries in this task are strong color transitions. This module computes
+    opponent color channels (R-min, G-min, B-min) plus value (max), takes their
+    Sobel gradient magnitude (squared) and concatenates it as a 4th channel, so
+    hue/saturation and brightness boundaries are all captured at input resolution
+    without changing the external 3-channel input.
+    """
+
+    def __init__(self):
+        super().__init__()
+        sobel_x = torch.tensor([[[[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]]], dtype=torch.float32)
+        sobel_y = torch.tensor([[[[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]]], dtype=torch.float32)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+    def forward(self, x):
+        if x.shape[1] != 3:
+            return x
+        r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+        mn = torch.min(torch.min(r, g), b)
+        mx = torch.max(torch.max(r, g), b)
+        edge = torch.zeros_like(mx)
+        for c in (r - mn, g - mn, b - mn, mx):
+            gx = F.conv2d(c, self.sobel_x, padding=1)
+            gy = F.conv2d(c, self.sobel_y, padding=1)
+            edge = edge + gx * gx + gy * gy
+        return torch.cat([x, edge], dim=1)
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation

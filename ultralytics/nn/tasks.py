@@ -40,6 +40,7 @@ from ultralytics.nn.modules import (
     CBFuse,
     CBLinear,
     Classify,
+    ChromaEdge,
     Concat,
     Conv,
     Conv2,
@@ -524,10 +525,34 @@ class LaneRobotModel(DetectionModel):
     def __init__(self, cfg="yolo26n-lane.yaml", ch=3, nc=None, verbose=True):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
         self.task = "lane"
+        self.chroma_edge = ChromaEdge()
+        # First stem conv accepts RGB + chroma-edge (4 channels); keep the first 3
+        # input-channel weights from the 3-channel build for better transfer init.
+        first = self.model[0]
+        if isinstance(first, Conv) and first.conv.in_channels == 3:
+            old_conv = first.conv
+            new_conv = nn.Conv2d(
+                4,
+                old_conv.out_channels,
+                old_conv.kernel_size,
+                old_conv.stride,
+                old_conv.padding,
+                bias=old_conv.bias is not None,
+            )
+            with torch.no_grad():
+                new_conv.weight[:, :3] = old_conv.weight
+                if old_conv.bias is not None:
+                    new_conv.bias.copy_(old_conv.bias)
+            first.conv = new_conv
         self.names = {i: f"lane_{i}" for i in range(getattr(self.model[-1], "num_lanes", 2))}
 
     def init_criterion(self):
         return LaneRobotLoss(self)
+
+    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+        """Prepend the in-graph color-boundary prior, keeping the external 3-channel input."""
+        x = self.chroma_edge(x)
+        return super()._predict_once(x, profile=profile, visualize=visualize, embed=embed)
 
 
 class OBBModel(DetectionModel):

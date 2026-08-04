@@ -1287,6 +1287,9 @@ class LaneRobotLoss:
         self.soft_label = bool(getattr(args, "lane_soft_label", True)) if args is not None else True
         self.soft_sigma = float(getattr(args, "lane_soft_sigma", 1.5)) if args is not None else 1.5
         self.topk = int(getattr(args, "lane_softargmax_topk", 5)) if args is not None else 5
+        self.lane_end_row_start = int(getattr(args, "lane_end_row_start", 25)) if args is not None else 25
+        self.lane_end_row_end = int(getattr(args, "lane_end_row_end", 35)) if args is not None else 35
+        self.lane_end_weight = float(getattr(args, "lane_end_weight", 3.0)) if args is not None else 3.0
 
     @staticmethod
     def _split_preds(preds):
@@ -1337,7 +1340,7 @@ class LaneRobotLoss:
             x = x + offset.squeeze(1).clamp(-0.5, 0.5)
         return x
 
-    def _soft_label_ce(self, logits, target, target_x, valid):
+    def _soft_label_ce(self, logits, target, target_x, valid, row_w):
         import torch
         import torch.nn.functional as F
 
@@ -1352,7 +1355,7 @@ class LaneRobotLoss:
         soft[:, self.no_lane_idx : self.no_lane_idx + 1] = 0.0
         soft = soft / soft.sum(dim=1, keepdim=True).clamp_min(1e-6)
         logp = F.log_softmax(logits, dim=1)
-        loss_valid = (-(soft * logp).sum(dim=1))[valid].mean()
+        loss_valid = (-(soft * logp).sum(dim=1) * row_w)[valid].mean()
 
         invalid = ~valid
         if invalid.any():
@@ -1367,9 +1370,12 @@ class LaneRobotLoss:
 
         logits, offset = self._split_preds(preds)
         target, target_x, valid = self._target_tensors(batch, logits.device)
+        row_w = torch.ones(logits.shape[2], device=logits.device, dtype=logits.dtype)
+        row_w[self.lane_end_row_start : self.lane_end_row_end] = self.lane_end_weight
+        row_w = row_w.view(1, -1, 1)
 
         if self.soft_label:
-            ce = self._soft_label_ce(logits, target, target_x, valid)
+            ce = self._soft_label_ce(logits, target, target_x, valid, row_w)
         else:
             ce = F.cross_entropy(logits, target, reduction="mean")
 
@@ -1379,14 +1385,20 @@ class LaneRobotLoss:
 
         pred_x = self._local_soft_argmax(logits, offset=offset)
         if valid.any():
-            loc = F.smooth_l1_loss(pred_x[valid] / max(self.x_grids - 1, 1), target_x[valid] / max(self.x_grids - 1, 1))
+            loc_raw = F.smooth_l1_loss(
+                pred_x / max(self.x_grids - 1, 1),
+                target_x / max(self.x_grids - 1, 1),
+                reduction="none",
+            )
+            loc = (loc_raw * row_w)[valid].mean()
         else:
             loc = logits.sum() * 0.0
 
         if offset is not None and valid.any():
             base = target_x.round().clamp(0, self.x_grids - 1)
             off_t = (target_x - base).clamp(-0.5, 0.5)
-            offset_loss = F.smooth_l1_loss(offset.squeeze(1)[valid], off_t[valid])
+            offset_raw = F.smooth_l1_loss(offset.squeeze(1)[valid], off_t[valid], reduction="none")
+            offset_loss = (offset_raw * row_w.expand(*valid.shape)[valid]).mean()
         else:
             offset_loss = logits.sum() * 0.0
 
