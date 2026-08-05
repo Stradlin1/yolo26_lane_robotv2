@@ -1,0 +1,23 @@
+# LaneRobot row-anchor dataset template
+# Label format per line:
+#   lane_id x1 y1 x2 y2 ... x56 y56
+# x is normalized [0,1]; x=-1 means absent/no-lane. y is normalized [0,1].
+# Default label path follows images/... -> labels/... with the same basename and .txt suffix.
+
+path: /home/baater/ultralytics/datasets
+train: images/train
+val: images/valid
+
+# Optional explicit label roots. Remove these to use images/... -> labels/... convention.
+# train_labels: labels/train
+# val_labels: labels/val
+
+x_grids: 160
+row_anchors: 56
+num_lanes: 1
+y_start: 0.67
+y_end: 1.0
+channels: 3
+nc: 1
+names:
+  0: lane_0
