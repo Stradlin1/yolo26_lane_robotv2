@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from ultralytics import YOLO
@@ -30,6 +31,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = PROJECT_ROOT / "ultralytics/cfg/models/26/yolo26s-lane-v3b.yaml"
 DEFAULT_DATA = PROJECT_ROOT / "ultralytics/cfg/datasets/lane-robot.yaml"
 DEFAULT_RUNS = PROJECT_ROOT / "runs/lane"
+
+# Non-interactive shells (nohup/tmux) do not source ~/.bashrc; keep the dataset
+# root self-contained so training works regardless of the shell environment.
+os.environ.setdefault("LANE_ROBOT_DATASETS", str(PROJECT_ROOT / "datasets"))
 
 
 # V3-B 定稿增强配置：几何只做轻微位姿扰动，颜色保持保守，连续结构增强全部关闭。
@@ -114,7 +119,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lane-soft-sigma", type=float, default=1.0, help="Gaussian sigma for soft-label CE.")
     parser.add_argument("--lane-softargmax-topk", type=int, default=5, help="Top-k window for soft-argmax.")
     parser.add_argument("--lane-exist-thr", type=float, default=0.5, help="No-lane probability threshold.")
-    parser.add_argument("--lane-end-weight", type=float, default=3.0, help="Extra weight for end-segment rows (r25-34).")
+    parser.add_argument("--lane-end-weight", type=float, default=1.0, help="Extra weight for end-segment rows (r25-34); 1.0 disables.")
+    parser.add_argument(
+        "--lane-end-weight-tail",
+        type=float,
+        default=6.0,
+        help="End-segment weight at the last row (linear ramp from --lane-end-weight); 1.0 disables.",
+    )
+    parser.add_argument(
+        "--lane-end-no-lane-weight",
+        type=float,
+        default=1.0,
+        help="Multiplier for no-lane supervision inside the end-segment band; 1.0 disables.",
+    )
 
     parser.add_argument("--save-period", type=int, default=100, help="Save checkpoint every N epochs; -1 disables.")
     parser.add_argument("--seed", type=int, default=42)
@@ -131,6 +148,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--patience must be 0 or greater")
     if args.batch != -1 and args.batch <= 0:
         parser.error("--batch must be -1 (auto) or a positive value (<=1 means a GPU-memory fraction)")
+    if args.batch > 1 and float(args.batch).is_integer():
+        args.batch = int(args.batch)
     if args.img_height <= 0 or args.img_width <= 0:
         parser.error("image dimensions must be greater than 0")
     if not (0.0 < args.fraction <= 1.0):
@@ -216,6 +235,8 @@ def main() -> None:
         "lane_softargmax_topk": args.lane_softargmax_topk,
         "lane_exist_thr": args.lane_exist_thr,
         "lane_end_weight": args.lane_end_weight,
+        "lane_end_weight_tail": args.lane_end_weight_tail,
+        "lane_end_no_lane_weight": args.lane_end_no_lane_weight,
         **AUGMENTATION_CONFIG,
     }
 
@@ -235,8 +256,9 @@ def main() -> None:
     print(
         "lane loss    : "
         f"ce={args.lane_ce}, loc={args.lane_loc}, exist={args.lane_exist}, "
-        f"smooth={args.lane_smooth}, curv={args.lane_curv}, offset={args.lane_offset}, "
-        f"end_weight={args.lane_end_weight}"
+        f"smooth={args.lane_smooth}, curv={args.lane_curv}, offset=disabled(plan-A), "
+        f"end_weight={args.lane_end_weight}->{args.lane_end_weight_tail}, "
+        f"no_lane_w={args.lane_end_no_lane_weight}"
     )
     print(
         "augmentation : "

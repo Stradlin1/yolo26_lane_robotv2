@@ -17,8 +17,8 @@ from ultralytics.models.yolo.lane.geometry import parse_letterbox_color
 from ultralytics.models.yolo.lane.plotting import decode_lane, save_lane_grid
 from ultralytics.models.yolo.lane.val import get_lane_head
 from ultralytics.nn.tasks import LaneRobotModel, yaml_model_load
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, YAML
-from ultralytics.utils.torch_utils import unwrap_model
+from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER, RANK, YAML
+from ultralytics.utils.torch_utils import strip_optimizer, torch_distributed_zero_first, unwrap_model
 
 
 class LaneRobotTrainer(BaseTrainer):
@@ -99,6 +99,30 @@ class LaneRobotTrainer(BaseTrainer):
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
         return LaneRobotDataset(img_path, self.args, self.data, mode=mode)
+
+    def _setup_train(self):
+        """Remember rectangular [h, w] imgsz and restore it after BaseTrainer's square-int check."""
+        imgsz = self.args.imgsz
+        if isinstance(imgsz, (list, tuple)) and len(imgsz) == 2:
+            self._lane_rect_imgsz = [int(imgsz[0]), int(imgsz[1])]
+        super()._setup_train()
+        # BaseTrainer forces a square int (used by autobatch); restore the rectangular
+        # target so training logs, validation, and downstream code all see [h, w].
+        rect = getattr(self, "_lane_rect_imgsz", None)
+        if rect is not None:
+            self.args.imgsz = list(rect)
+
+    def _build_train_pipeline(self):
+        """Build dataloaders with rectangular [h, w] imgsz (lane inputs are not square)."""
+        orig = getattr(self.args, "imgsz", None)
+        rect = getattr(self, "_lane_rect_imgsz", None)
+        if rect is not None:
+            self.args.imgsz = rect
+        try:
+            super()._build_train_pipeline()
+        finally:
+            if orig is not None:
+                self.args.imgsz = orig
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
         dataset = self.build_dataset(dataset_path, mode, batch_size)
@@ -183,9 +207,13 @@ class LaneRobotTrainer(BaseTrainer):
 
     def get_validator(self):
         self.loss_names = "lane_ce", "lane_loc", "lane_exist", "lane_smooth", "lane_curv", "lane_offset"
-        return yolo.lane.LaneRobotValidator(
+        validator = yolo.lane.LaneRobotValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
+        rect = getattr(self, "_lane_rect_imgsz", None)
+        if rect is not None:
+            validator.args.imgsz = list(rect)
+        return validator
 
     def label_loss_items(self, loss_items=None, prefix: str = "train"):
         keys = [f"{prefix}/{x}" for x in self.loss_names]
@@ -225,7 +253,22 @@ class LaneRobotTrainer(BaseTrainer):
         pass
 
     def final_eval(self):
-        super().final_eval()
+        # Replicate BaseTrainer.final_eval but validate in trainer mode so the dataset
+        # paths resolved by get_dataset() (including LANE_ROBOT_DATASETS) are reused,
+        # instead of BaseValidator re-reading the raw YAML path via check_det_dataset().
+        model = self.best if self.best.exists() else None
+        with torch_distributed_zero_first(LOCAL_RANK):  # strip only on GPU 0; other GPUs should wait
+            if RANK in {-1, 0}:
+                ckpt = strip_optimizer(self.last) if self.last.exists() else {}
+                if model:
+                    strip_optimizer(self.best, updates={"train_results": ckpt.get("train_results")})
+        if model:
+            LOGGER.info(f"\nValidating {model}...")
+            self.validator.args.plots = self.args.plots
+            self.validator.args.compile = False  # disable final val compile as too slow
+            self.metrics = self.validator(self)
+            self.metrics.pop("fitness", None)
+            self.run_callbacks("on_fit_epoch_end")
         # Ensure a final visual artifact exists even when early stopping fires before the final scheduled plot.
         if RANK in {-1, 0} and self.args.plots and hasattr(self, "test_loader"):
             model = self.ema.ema if self.ema else self.model

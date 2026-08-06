@@ -1900,6 +1900,38 @@ class LaneRobotV2(nn.Module):
         return {"cls": cls, "offset": offset}
 
 
+class CausalRowConv(nn.Module):
+    """Causal 1D conv over row-anchor features (r=0 bottom -> r=R-1 top).
+
+    Each output row aggregates the current row plus nearer (lower-index) rows only,
+    so image-bottom (near) information flows toward far rows without lookahead.
+    Implemented with Conv2d(kernel=(1,k)) on [B,C,1,R] plus left-only zero padding,
+    keeping the exported graph to standard Pad+Conv ops (BPU-friendly).
+    """
+
+    def __init__(self, channels: int, kernel: int = 3, layers: int = 2):
+        super().__init__()
+        self.channels = int(channels)
+        self.kernel = int(kernel)
+        self.layers = int(layers)
+        self.convs = nn.ModuleList(
+            nn.Conv2d(self.channels, self.channels, kernel_size=(1, self.kernel), padding=0, bias=True)
+            for _ in range(self.layers)
+        )
+        for conv in self.convs:
+            linear_init(conv)
+
+    def forward(self, x):
+        """Apply causal row mixing; x is [B, C, R] and output keeps the same shape."""
+        y = x.unsqueeze(2)  # [B, C, 1, R]
+        for i, conv in enumerate(self.convs):
+            y = F.pad(y, (self.kernel - 1, 0))  # pad only the nearer-row side
+            y = conv(y)
+            if i < self.layers - 1:
+                y = F.relu(y)
+        return y.squeeze(2)
+
+
 class LaneRobotV3B(nn.Module):
     """Row-anchor lane head with per-lane classifiers shared across row anchors.
 
@@ -1930,6 +1962,8 @@ class LaneRobotV3B(nn.Module):
         feat_w: int = 28,
         y_start: float = 0.333333,
         y_end: float = 1.0,
+        causal_kernel: int = 3,
+        causal_layers: int = 2,
         ch: tuple = (),
     ):
         super().__init__()
@@ -1943,6 +1977,8 @@ class LaneRobotV3B(nn.Module):
         self.feat_w = int(feat_w)
         self.y_start = float(y_start)
         self.y_end = float(y_end)
+        self.causal_kernel = int(causal_kernel)
+        self.causal_layers = int(causal_layers)
         self.no_lane_idx = self.x_grids
         self.out_shape = (self.x_grids + 1, self.row_anchors, self.num_lanes)
 
@@ -1950,6 +1986,8 @@ class LaneRobotV3B(nn.Module):
         self._build_row_sampler(self.feat_h)
 
         row_dim = self.reduce_channels * self.feat_w + self.reduce_channels  # columns + row mean
+        # Near-to-far row coupling: each row sees current and nearer rows only.
+        self.causal = CausalRowConv(row_dim, kernel=self.causal_kernel, layers=self.causal_layers)
         self.proj = nn.Linear(row_dim, self.hidden_dim)
         self.act = nn.ReLU(inplace=False)
         self.row_embed = nn.Parameter(torch.zeros(self.row_anchors, self.hidden_dim))
@@ -1997,6 +2035,7 @@ class LaneRobotV3B(nn.Module):
         row_mean = xs.mean(dim=-1).permute(0, 2, 1)  # [B, R, C]
         row_feat = torch.cat((row_feat, row_mean), dim=-1)  # [B, R, C*W + C]
 
+        row_feat = self.causal(row_feat.permute(0, 2, 1)).permute(0, 2, 1)  # [B, R, C*W + C]
         z = self.act(self.proj(row_feat))  # [B, R, hidden_dim]
         z = z + self.row_embed.unsqueeze(0)
 

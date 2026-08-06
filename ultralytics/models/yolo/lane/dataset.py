@@ -124,6 +124,13 @@ class LaneRobotDataset(Dataset):
         if not self.im_files:
             raise FileNotFoundError(f"No lane images found in {self.img_path}")
         self.labels = [self._label_path(path) for path in self.im_files]
+        # Ultralytics-style dataset fraction (train only; useful for smoke tests on CPU).
+        if self.is_train:
+            fraction = float(getattr(args, "fraction", 1.0))
+            if 0.0 < fraction < 1.0:
+                n = max(1, int(round(len(self.im_files) * fraction)))
+                self.im_files = self.im_files[:n]
+                self.labels = self.labels[:n]
 
     def _parse_flip_lane_pairs(self, raw_pairs):
         if raw_pairs is None:

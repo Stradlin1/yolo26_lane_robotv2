@@ -1290,6 +1290,8 @@ class LaneRobotLoss:
         self.lane_end_row_start = int(getattr(args, "lane_end_row_start", 25)) if args is not None else 25
         self.lane_end_row_end = int(getattr(args, "lane_end_row_end", 35)) if args is not None else 35
         self.lane_end_weight = float(getattr(args, "lane_end_weight", 3.0)) if args is not None else 3.0
+        self.lane_end_weight_tail = float(getattr(args, "lane_end_weight_tail", 6.0)) if args is not None else 6.0
+        self.lane_end_no_lane_weight = float(getattr(args, "lane_end_no_lane_weight", 0.3)) if args is not None else 0.3
 
     @staticmethod
     def _split_preds(preds):
@@ -1340,7 +1342,7 @@ class LaneRobotLoss:
             x = x + offset.squeeze(1).clamp(-0.5, 0.5)
         return x
 
-    def _soft_label_ce(self, logits, target, target_x, valid, row_w):
+    def _soft_label_ce(self, logits, target, target_x, valid, row_w, no_lane_row_w):
         import torch
         import torch.nn.functional as F
 
@@ -1359,7 +1361,13 @@ class LaneRobotLoss:
 
         invalid = ~valid
         if invalid.any():
-            loss_invalid = F.cross_entropy(logits.permute(0, 2, 3, 1)[invalid], target[invalid], reduction="mean")
+            ce_invalid = F.cross_entropy(
+                logits.permute(0, 2, 3, 1)[invalid],
+                target[invalid],
+                reduction="none",
+            )
+            no_lane_w = no_lane_row_w.expand(logits.shape[0], logits.shape[2], logits.shape[3])[invalid]
+            loss_invalid = (ce_invalid * no_lane_w).mean()
         else:
             loss_invalid = logits.sum() * 0.0
         return loss_valid + 0.2 * loss_invalid
@@ -1371,17 +1379,24 @@ class LaneRobotLoss:
         logits, offset = self._split_preds(preds)
         target, target_x, valid = self._target_tensors(batch, logits.device)
         row_w = torch.ones(logits.shape[2], device=logits.device, dtype=logits.dtype)
-        row_w[self.lane_end_row_start : self.lane_end_row_end] = self.lane_end_weight
+        start, end = self.lane_end_row_start, self.lane_end_row_end
+        if end > start:
+            ramp = torch.linspace(0.0, 1.0, end - start, device=logits.device, dtype=logits.dtype)
+            row_w[start:end] = self.lane_end_weight + (self.lane_end_weight_tail - self.lane_end_weight) * ramp
         row_w = row_w.view(1, -1, 1)
+        no_lane_row_w = torch.ones_like(row_w)
+        no_lane_row_w[..., start:end, :] = self.lane_end_no_lane_weight
 
         if self.soft_label:
-            ce = self._soft_label_ce(logits, target, target_x, valid, row_w)
+            ce = self._soft_label_ce(logits, target, target_x, valid, row_w, no_lane_row_w)
         else:
             ce = F.cross_entropy(logits, target, reduction="mean")
 
         no_lane_logit = logits[:, self.no_lane_idx]
         lane_exist_logit = torch.logsumexp(logits[:, : self.x_grids], dim=1) - no_lane_logit
-        exist = F.binary_cross_entropy_with_logits(lane_exist_logit, valid.float())
+        exist_raw = F.binary_cross_entropy_with_logits(lane_exist_logit, valid.float(), reduction="none")
+        exist_w = torch.where(valid, torch.ones_like(valid.float()), no_lane_row_w.expand_as(valid))
+        exist = (exist_raw * exist_w).mean()
 
         pred_x = self._local_soft_argmax(logits, offset=offset)
         if valid.any():
@@ -1394,13 +1409,10 @@ class LaneRobotLoss:
         else:
             loc = logits.sum() * 0.0
 
-        if offset is not None and valid.any():
-            base = target_x.round().clamp(0, self.x_grids - 1)
-            off_t = (target_x - base).clamp(-0.5, 0.5)
-            offset_raw = F.smooth_l1_loss(offset.squeeze(1)[valid], off_t[valid], reduction="none")
-            offset_loss = (offset_raw * row_w.expand(*valid.shape)[valid]).mean()
-        else:
-            offset_loss = logits.sum() * 0.0
+        # Plan-A: no independent offset target. The offset head is trained only through
+        # `loc` (soft-argmax + offset vs. target_x), so its objective matches inference
+        # (compensating soft-argmax decoding error) and cannot fight the loc loss.
+        offset_loss = logits.sum() * 0.0
 
         valid_pair = valid[:, 1:] & valid[:, :-1]
         if valid_pair.any():

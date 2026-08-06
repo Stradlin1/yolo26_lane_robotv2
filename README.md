@@ -2,17 +2,17 @@
 
 基于 Ultralytics YOLO26 与 UFLD / Row-Anchor 思路改造的机器人前视多线检测工程。
 
-> 更新日期：2026-08-04  
+> 更新日期：2026-08-06  
 > 当前开发分支：`zbn`  
-> 当前训练方案：`LaneRobotV3B`，输入 `256×448`  
-> 已验证部署基线：`LaneRobotV2`，输入 `320×320`，RDK X5 BPU + CPU 混合执行
+> 当前训练方案：`LaneRobotV3B + CausalRowConv`，输入 `256×448`（非正方形）  
+> 部署状态：V3B+causal 正式训练完成，ONNX 与 RDK X5 int8 量化已生成（待部署实测）
 
 本项目将原始单线 Lane Robot 改造成四个固定语义槽位的多线检测系统。`zbn` 分支新增了 V3-B Row-Anchor Head、独立训练入口、逐槽位验证指标和可移植的数据集路径配置。
 
 需要明确区分：
 
 - **V2**：训练、验证、PyTorch 推理、ONNX 导出、ONNX Runtime 推理和 RDK X5 Runtime BIN 已跑通，是当前部署基线。
-- **V3B**：模型结构和训练管线已经接入代码，输出协议保持兼容；正式训练结果、ONNX 导出和 RDK X5 量化仍需重新验证。
+- **V3B + Causal**：模型结构、训练管线、正式训练、ONNX 导出和 RDK X5 量化均已完成，输出协议保持兼容。
 
 ---
 
@@ -84,6 +84,8 @@ Conv1x1: 256 → 16
   ↓
 每行特征：16×28 展平 + 16 维行均值 = 464
   ↓
+Causal Row Conv：2×Conv2d(kernel=(1,3))，近处行信息向远处行传播
+  ↓
 共享投影：464 → 512 + ReLU
   ↓
 加可学习 Row Embedding
@@ -101,6 +103,7 @@ V3B 的关键变化：
 - 分类器参数在 56 个 Row Anchors 之间共享。
 - 四个语义槽位使用独立分类器和 offset 回归器。
 - 使用可学习 Row Embedding 保留不同纵向位置的信息。
+- 行向量经过 Causal Row Conv（r=0 底部 → r=55 顶部单向传播），远行可以显式参考近处行信息，缓解弱特征远行的孤立决策与跳变。
 - offset 经 `tanh` 限制到 `[-0.5, 0.5]`。
 - 不再使用 V2 中一次性输出 `321×56×4` 的单个大分类 Linear。
 
@@ -122,6 +125,8 @@ feat_h: 16
 feat_w: 28
 y_start: 0.333333
 y_end: 1.0
+causal_kernel: 3
+causal_layers: 2
 ```
 
 目标输入为：
@@ -360,6 +365,15 @@ python -c "import ultralytics; print(ultralytics.__file__)"
 
 ## 9. V3B 训练
 
+> ⚠️ **训练必须使用非正方形 imgsz `[256, 448]`**。Ultralytics 官方 Trainer 会把 train/val imgsz 强制为正方形
+> （`check_imgsz(max_dim=1)` 会把 `[256, 448]` 改写成 `448`），导致训练输入变成 `448×448`，
+> 与导出/推理的 `256×448` 不一致——历史版本曾因此出现训练/推理口径错位。本仓库已在
+> `LaneRobotTrainer` / `LaneRobotValidator` 中修复为保留矩形 imgsz，但使用时必须遵守：
+>
+> 1. 通过 `train_v3b.py`（或 lane 分支的 Trainer）启动，不要直接调用通用 `YOLO.train(imgsz=448)`；
+> 2. 启动日志必须出现 `Image sizes [256, 448] train, [256, 448] val`；
+> 3. 若看到 `Image sizes 448 train, 448 val`（单值）或 `updating to 'imgsz=448'` 以外的强制提示，说明走了官方正方形逻辑，立即停止。
+
 ### 9.1 默认训练配置
 
 `train_v3b.py` 的主要默认值：
@@ -399,6 +413,21 @@ copy_paste  = 0.0
 erasing     = 0.0
 ```
 
+推荐正式训练命令（从上一版 V3B 权重续训；新增的 causal 层会自动随机初始化，
+其余 backbone/neck/head 全部继承，启动日志会显示 `Transferred 283/285 items`）：
+
+```bash
+python train_v3b.py \
+  --weights runs/lane/lane_v3b/weights/best.pt \
+  --name lane_v3b_causal \
+  --epochs 200 \
+  --patience 60 \
+  --batch -1
+```
+
+`--batch -1` 使用 Ultralytics Autobatch（RTX 4090 上约为 107）；`--patience 60` 配合
+续训通常会在 100 轮以内早停（本仓库实测 best epoch 39、99 轮早停，总耗时约 2.7 小时）。
+
 ### 9.2 从 V2 权重迁移
 
 推荐命令：
@@ -410,6 +439,9 @@ python train_v3b.py \
 ```
 
 V2 与 V3B 的 Backbone / Neck 保持相同，兼容层可迁移；V3B Head 结构不同，应从随机初始化开始训练。启动日志中应检查实际 transferred 参数数量，不能只根据命令假设 Head 已正确排除。
+
+从已有 V3B checkpoint 续训同理：`--weights runs/lane/lane_v3b/weights/best.pt`。
+若旧 checkpoint 不含 causal 权重，Ultralytics 会非严格加载，仅 causal 层随机初始化，无需手动处理。
 
 常用覆盖：
 
@@ -454,7 +486,10 @@ LaneRobotV3B
 input  = [B, 3, 256, 448]
 cls    = [B, 321, 56, 4]
 offset = [B,   1, 56, 4]
+causal = CausalRowConv(kernel=3, layers=2)
 ```
+
+同时确认日志出现 `Image sizes [256, 448] train, [256, 448] val`（非正方形已生效）。
 
 训练日志仍包含六项损失：
 
@@ -485,6 +520,19 @@ round(target_x)
 ```
 
 这样分类网格中心与 offset 残差使用相同基准，避免一个使用 floor、另一个使用 round 造成目标不一致。
+
+### 10.1 Offset 监督（Plan-A）
+
+offset 头**不再有独立的 SmoothL1 目标**（`lane_offset` 参数保留但已停用），统一由
+`lane_loc` 对 `soft-argmax(cls) + offset` 的整体位置进行监督。这样 offset 学到的是
+“soft-argmax 解码偏差的补偿”，训练目标与推理行为完全一致，避免弱特征行上两个损失互相拉扯。
+
+### 10.2 远端行加权已拉平
+
+`lane_end_weight` / `lane_end_weight_tail` / `lane_end_no_lane_weight` 默认均为 `1.0`。
+历史版本曾对 r25~34 行 CE/loc 加权 3→6、并将 no-lane 监督降权到 0.3，实测导致远端
+误检翻倍。causal 行耦合已从结构上补偿远端信息，不再需要 loss 加权补丁；如需复现旧行为，
+可显式传入 `--lane-end-weight 3.0 --lane-end-weight-tail 6.0 --lane-end-no-lane-weight 0.3`。
 
 ---
 

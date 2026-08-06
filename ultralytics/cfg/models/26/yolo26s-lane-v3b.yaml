@@ -6,6 +6,8 @@
 #   conv_1x1 256->16 -> bilinear row sampling (56 anchor rows)
 #   -> per-row flatten (16x28) + row mean -> 464 -> proj 464->512
 #   -> + row embedding -> 4 per-lane cls (512->321) + 4 per-lane offset (512->1)
+# Causal row coupling (2x Conv2d kernel=(1,3), near->far) is applied on the 464-dim
+# row features before proj, so far rows can reference near rows' information.
 # Target input: 256x448 (H=256, W=448), both divisible by 32.
 # Output: {cls: [B, x_grids+1, row_anchors, num_lanes], offset: [B, 1, row_anchors, num_lanes]}.
 
@@ -21,6 +23,8 @@ feat_h: 16
 feat_w: 28
 y_start: 0.333333
 y_end: 1.0
+causal_kernel: 3
+causal_layers: 2
 scales:
   n: [0.50, 0.25, 1024]
   s: [0.50, 0.50, 1024]
@@ -52,4 +56,4 @@ head:
   - [[-1, -2], 1, Concat, [1]] # 14
   - [-1, 1, Conv, [512, 3, 1]] # 15
   # LaneRobotV3B head: shared row features + per-lane classifiers
-  - [-1, 1, LaneRobotV3B, [x_grids, row_anchors, num_lanes, reduce_channels, hidden_dim, feat_h, feat_w, y_start, y_end]] # 16
+  - [-1, 1, LaneRobotV3B, [x_grids, row_anchors, num_lanes, reduce_channels, hidden_dim, feat_h, feat_w, y_start, y_end, causal_kernel, causal_layers]] # 16

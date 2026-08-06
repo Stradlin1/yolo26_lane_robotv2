@@ -8,7 +8,9 @@
 *.patch
 *.bundle
 *.onnx
+*.bin
 /previews/
+/calib100/
 /docs/conclusions_2026-08-04.md
 __pycache__/
 *.py[cod]
