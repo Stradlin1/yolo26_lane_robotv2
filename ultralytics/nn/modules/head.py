@@ -1943,6 +1943,10 @@ class LaneRobotV3B(nn.Module):
         -> shared row embedding
         -> 4 per-lane classifiers (hidden_dim -> x_grids+1), each shared across rows
         -> 4 per-lane offset heads (hidden_dim -> 1)
+        -> lane1 side branch: lane0's soft-argmax row positions are concatenated to the
+           lane1 classifier input (hidden_dim -> hidden_dim+1) as a conditioning signal.
+           No fixed geometric prior is imposed; the model learns lane1's relationship to
+           lane0 itself. Output layout unchanged (lane1 cls remains absolute grid coords).
 
     Keeps the exact V2 output protocol:
         {"cls": [B, x_grids+1, row_anchors, num_lanes],
@@ -1991,7 +1995,11 @@ class LaneRobotV3B(nn.Module):
         self.proj = nn.Linear(row_dim, self.hidden_dim)
         self.act = nn.ReLU(inplace=False)
         self.row_embed = nn.Parameter(torch.zeros(self.row_anchors, self.hidden_dim))
-        self.cls_heads = nn.ModuleList(nn.Linear(self.hidden_dim, self.x_grids + 1) for _ in range(self.num_lanes))
+        # lane1 classifier gets one extra conditioning channel (lane0 row positions).
+        self.cls_heads = nn.ModuleList(
+            nn.Linear(self.hidden_dim + (1 if i == 1 else 0), self.x_grids + 1)
+            for i in range(self.num_lanes)
+        )
         self.offset_heads = nn.ModuleList(nn.Linear(self.hidden_dim, 1) for _ in range(self.num_lanes))
         for layer in (self.proj, *self.cls_heads, *self.offset_heads):
             linear_init(layer)
@@ -2022,6 +2030,18 @@ class LaneRobotV3B(nn.Module):
         x = F.conv2d(x, self.row_conv_w, groups=c)  # [B, C*R, 1, W]
         return x.view(b, c, self.row_anchors, w)
 
+    def _soft_argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        """Top-k soft-argmax over the valid x-grid classes; returns float grid positions [B, R]."""
+        probs = logits.softmax(dim=-1)[:, : self.x_grids]
+        k = min(5, self.x_grids)
+        topv, topi = probs.topk(k=k, dim=-1)
+        return (topv * topi.float()).sum(dim=-1) / topv.sum(dim=-1).clamp_min(1e-6)
+
+    def _lane0_side(self, z: torch.Tensor) -> torch.Tensor:
+        """Return lane0's soft-argmax row positions [B, R] as a detached conditioning signal."""
+        logits0 = self.cls_heads[0](z)
+        return self._soft_argmax(logits0).detach().to(z.dtype)
+
     def forward(self, x):
         """Forward through the V3-B head, returning the V2-compatible cls/offset dict."""
         x = self.conv_1x1(x)
@@ -2039,7 +2059,12 @@ class LaneRobotV3B(nn.Module):
         z = self.act(self.proj(row_feat))  # [B, R, hidden_dim]
         z = z + self.row_embed.unsqueeze(0)
 
-        cls = torch.stack([head(z) for head in self.cls_heads], dim=2)  # [B, R, L, X+1]
+        # Lane1 side branch: condition on lane0's predicted geometry without a fixed prior.
+        z1 = torch.cat((z, self._lane0_side(z).unsqueeze(-1)), dim=-1) if self.num_lanes > 1 else z
+        cls_logits = []
+        for i, head in enumerate(self.cls_heads):
+            cls_logits.append(head(z1 if i == 1 else z))  # [B, R, X+1]
+        cls = torch.stack(cls_logits, dim=2)  # [B, R, L, X+1]
         offset = torch.stack([head(z) for head in self.offset_heads], dim=2)  # [B, R, L, 1]
         cls = cls.permute(0, 3, 1, 2).contiguous()  # [B, X+1, R, L]
         offset = torch.tanh(offset).permute(0, 3, 1, 2).contiguous() * 0.5  # [B, 1, R, L]

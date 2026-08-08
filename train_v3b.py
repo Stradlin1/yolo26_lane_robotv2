@@ -173,6 +173,27 @@ def require_file(path: Path, description: str) -> Path:
     return path
 
 
+def _reset_lane1_head(trainer) -> None:
+    """Re-initialize lane1 cls/offset heads after pretrained load.
+
+    Lane1's classifier input is conditioned on lane0's predicted geometry (side branch),
+    so the old checkpoint's lane1 branch must not carry its previous standalone meaning.
+    Called from the on_train_start callback (pretrained weights are already loaded).
+    """
+    from ultralytics.nn.modules.utils import linear_init
+    from ultralytics.nn.modules.head import LaneRobotV3B
+
+    head = next((m for m in trainer.model.modules() if isinstance(m, LaneRobotV3B)), None)
+    if head is None:
+        print("WARNING: LaneRobotV3B head not found; lane1 branch not reset.")
+        return
+    if head.num_lanes <= 1:
+        return
+    linear_init(head.cls_heads[1])
+    linear_init(head.offset_heads[1])
+    print("Lane1 cls/offset heads reset (side-conditioned residual scheme).")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -194,6 +215,9 @@ def main() -> None:
     else:
         model_path = require_file(args.model, "Model YAML")
         model = YOLO(str(model_path), task="lane")
+        if args.weights is not None:
+            # Pretrained weights are loaded inside trainer; reset lane1 branch afterwards.
+            model.add_callback("on_train_start", _reset_lane1_head)
         resume_value = False
         model_source = model_path
 
